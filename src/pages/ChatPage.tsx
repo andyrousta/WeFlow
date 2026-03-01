@@ -142,6 +142,35 @@ function cleanMessageContent(content: string): string {
   return content.trim()
 }
 
+const CHAT_SESSION_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const CHAT_SESSION_PREVIEW_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION = 30
+const CHAT_SESSION_PREVIEW_MAX_SESSIONS = 18
+
+function buildChatSessionListCacheKey(scope: string): string {
+  return `weflow.chat.sessions.v1::${scope || 'default'}`
+}
+
+function buildChatSessionPreviewCacheKey(scope: string): string {
+  return `weflow.chat.preview.v1::${scope || 'default'}`
+}
+
+function normalizeChatCacheScope(dbPath: unknown, wxid: unknown): string {
+  const db = String(dbPath || '').trim()
+  const id = String(wxid || '').trim()
+  if (!db && !id) return 'default'
+  return `${db}::${id}`
+}
+
+function safeParseJson<T>(raw: string | null): T | null {
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return null
+  }
+}
+
 function formatYmdDateFromSeconds(timestamp?: number): string {
   if (!timestamp || !Number.isFinite(timestamp)) return '—'
   const d = new Date(timestamp * 1000)
@@ -176,6 +205,21 @@ interface SessionDetail {
   firstMessageTime?: number
   latestMessageTime?: number
   messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+interface SessionListCachePayload {
+  updatedAt: number
+  sessions: ChatSession[]
+}
+
+interface SessionPreviewCacheEntry {
+  updatedAt: number
+  messages: Message[]
+}
+
+interface SessionPreviewCachePayload {
+  updatedAt: number
+  entries: Record<string, SessionPreviewCacheEntry>
 }
 
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
@@ -406,6 +450,10 @@ function ChatPage(_props: ChatPageProps) {
   const preloadImageKeysRef = useRef<Set<string>>(new Set())
   const lastPreloadSessionRef = useRef<string | null>(null)
   const detailRequestSeqRef = useRef(0)
+  const chatCacheScopeRef = useRef('default')
+  const previewCacheRef = useRef<Record<string, SessionPreviewCacheEntry>>({})
+  const previewPersistTimerRef = useRef<number | null>(null)
+  const sessionListPersistTimerRef = useRef<number | null>(null)
 
   // 加载当前用户头像
   const loadMyAvatar = useCallback(async () => {
@@ -416,6 +464,150 @@ function ChatPage(_props: ChatPageProps) {
       }
     } catch (e) {
       console.error('加载用户头像失败:', e)
+    }
+  }, [])
+
+  const resolveChatCacheScope = useCallback(async (): Promise<string> => {
+    try {
+      const [dbPath, myWxid] = await Promise.all([
+        window.electronAPI.config.get('dbPath'),
+        window.electronAPI.config.get('myWxid')
+      ])
+      const scope = normalizeChatCacheScope(dbPath, myWxid)
+      chatCacheScopeRef.current = scope
+      return scope
+    } catch {
+      chatCacheScopeRef.current = 'default'
+      return 'default'
+    }
+  }, [])
+
+  const loadPreviewCacheFromStorage = useCallback((scope: string): Record<string, SessionPreviewCacheEntry> => {
+    try {
+      const cacheKey = buildChatSessionPreviewCacheKey(scope)
+      const payload = safeParseJson<SessionPreviewCachePayload>(window.localStorage.getItem(cacheKey))
+      if (!payload || typeof payload.updatedAt !== 'number' || !payload.entries) {
+        return {}
+      }
+      if (Date.now() - payload.updatedAt > CHAT_SESSION_PREVIEW_CACHE_TTL_MS) {
+        return {}
+      }
+      return payload.entries
+    } catch {
+      return {}
+    }
+  }, [])
+
+  const persistPreviewCacheToStorage = useCallback((scope: string, entries: Record<string, SessionPreviewCacheEntry>) => {
+    try {
+      const cacheKey = buildChatSessionPreviewCacheKey(scope)
+      const payload: SessionPreviewCachePayload = {
+        updatedAt: Date.now(),
+        entries
+      }
+      window.localStorage.setItem(cacheKey, JSON.stringify(payload))
+    } catch {
+      // ignore cache write failures
+    }
+  }, [])
+
+  const persistSessionPreviewCache = useCallback((sessionId: string, previewMessages: Message[]) => {
+    const id = String(sessionId || '').trim()
+    if (!id || !Array.isArray(previewMessages) || previewMessages.length === 0) return
+
+    const trimmed = previewMessages.slice(-CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION)
+    const currentEntries = { ...previewCacheRef.current }
+    currentEntries[id] = {
+      updatedAt: Date.now(),
+      messages: trimmed
+    }
+
+    const sortedIds = Object.entries(currentEntries)
+      .sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0))
+      .map(([entryId]) => entryId)
+
+    const keptIds = new Set(sortedIds.slice(0, CHAT_SESSION_PREVIEW_MAX_SESSIONS))
+    const compactEntries: Record<string, SessionPreviewCacheEntry> = {}
+    for (const [entryId, entry] of Object.entries(currentEntries)) {
+      if (keptIds.has(entryId)) {
+        compactEntries[entryId] = entry
+      }
+    }
+
+    previewCacheRef.current = compactEntries
+    if (previewPersistTimerRef.current !== null) {
+      window.clearTimeout(previewPersistTimerRef.current)
+    }
+    previewPersistTimerRef.current = window.setTimeout(() => {
+      persistPreviewCacheToStorage(chatCacheScopeRef.current, previewCacheRef.current)
+      previewPersistTimerRef.current = null
+    }, 220)
+  }, [persistPreviewCacheToStorage])
+
+  const hydrateSessionPreview = useCallback(async (sessionId: string) => {
+    const id = String(sessionId || '').trim()
+    if (!id) return
+
+    const localEntry = previewCacheRef.current[id]
+    if (
+      localEntry &&
+      Array.isArray(localEntry.messages) &&
+      localEntry.messages.length > 0 &&
+      Date.now() - localEntry.updatedAt <= CHAT_SESSION_PREVIEW_CACHE_TTL_MS
+    ) {
+      setMessages(localEntry.messages.slice())
+      setHasInitialMessages(true)
+      return
+    }
+
+    try {
+      const result = await window.electronAPI.chat.getCachedMessages(id)
+      if (!result.success || !Array.isArray(result.messages) || result.messages.length === 0) {
+        return
+      }
+      if (currentSessionRef.current !== id && pendingSessionLoadRef.current !== id) return
+      setMessages(result.messages)
+      setHasInitialMessages(true)
+      persistSessionPreviewCache(id, result.messages)
+    } catch {
+      // ignore preview cache errors
+    }
+  }, [persistSessionPreviewCache, setMessages])
+
+  const hydrateSessionListCache = useCallback((scope: string): boolean => {
+    try {
+      const cacheKey = buildChatSessionListCacheKey(scope)
+      const payload = safeParseJson<SessionListCachePayload>(window.localStorage.getItem(cacheKey))
+      if (!payload || typeof payload.updatedAt !== 'number' || !Array.isArray(payload.sessions)) {
+        previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+        return false
+      }
+      previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+      if (Date.now() - payload.updatedAt > CHAT_SESSION_LIST_CACHE_TTL_MS) {
+        return false
+      }
+      if (!Array.isArray(sessionsRef.current) || sessionsRef.current.length === 0) {
+        setSessions(payload.sessions)
+        sessionsRef.current = payload.sessions
+        return payload.sessions.length > 0
+      }
+      return false
+    } catch {
+      previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+      return false
+    }
+  }, [loadPreviewCacheFromStorage, setSessions])
+
+  const persistSessionListCache = useCallback((scope: string, nextSessions: ChatSession[]) => {
+    try {
+      const cacheKey = buildChatSessionListCacheKey(scope)
+      const payload: SessionListCachePayload = {
+        updatedAt: Date.now(),
+        sessions: nextSessions
+      }
+      window.localStorage.setItem(cacheKey, JSON.stringify(payload))
+    } catch {
+      // ignore cache write failures
     }
   }, [])
 
@@ -580,11 +772,12 @@ function ChatPage(_props: ChatPageProps) {
     setConnecting(true)
     setConnectionError(null)
     try {
+      const scopePromise = resolveChatCacheScope()
       const result = await window.electronAPI.chat.connect()
       if (result.success) {
         setConnected(true)
         const wxidPromise = window.electronAPI.config.get('myWxid')
-        await Promise.all([loadSessions(), loadMyAvatar()])
+        await Promise.all([scopePromise, loadSessions(), loadMyAvatar()])
         // 获取 myWxid 用于匹配个人头像
         const wxid = await wxidPromise
         if (wxid) setMyWxid(wxid as string)
@@ -596,7 +789,7 @@ function ChatPage(_props: ChatPageProps) {
     } finally {
       setConnecting(false)
     }
-  }, [loadMyAvatar])
+  }, [loadMyAvatar, resolveChatCacheScope])
 
   const handleAccountChanged = useCallback(async () => {
     senderAvatarCache.clear()
@@ -616,9 +809,13 @@ function ChatPage(_props: ChatPageProps) {
     setConnecting(false)
     setHasMoreMessages(true)
     setHasMoreLater(false)
+    const scope = await resolveChatCacheScope()
+    hydrateSessionListCache(scope)
     await connect()
   }, [
     connect,
+    resolveChatCacheScope,
+    hydrateSessionListCache,
     setConnected,
     setConnecting,
     setConnectionError,
@@ -631,6 +828,19 @@ function ChatPage(_props: ChatPageProps) {
     setSessionDetail,
     setSessions
   ])
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const scope = await resolveChatCacheScope()
+      if (cancelled) return
+      hydrateSessionListCache(scope)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [resolveChatCacheScope, hydrateSessionListCache])
 
   // 同步 currentSessionId 到 ref
   useEffect(() => {
@@ -684,6 +894,7 @@ function ChatPage(_props: ChatPageProps) {
       setLoadingSessions(true)
     }
     try {
+      const scope = await resolveChatCacheScope()
       const result = await window.electronAPI.chat.getSessions()
       if (result.success && result.sessions) {
         // 确保 sessions 是数组
@@ -695,12 +906,15 @@ function ChatPage(_props: ChatPageProps) {
 
           setSessions(nextSessions)
           sessionsRef.current = nextSessions
+          persistSessionListCache(scope, nextSessions)
           void hydrateSessionStatuses(nextSessions)
           // 立即启动联系人信息加载，不再延迟 500ms
           void enrichSessionsContactInfo(nextSessions)
         } else {
           console.error('mergeSessions returned non-array:', nextSessions)
           setSessions(sessionsArray)
+          sessionsRef.current = sessionsArray
+          persistSessionListCache(scope, sessionsArray)
           void hydrateSessionStatuses(sessionsArray)
           void enrichSessionsContactInfo(sessionsArray)
         }
@@ -1085,6 +1299,7 @@ function ChatPage(_props: ChatPageProps) {
       if (result.success && result.messages) {
         if (offset === 0) {
           setMessages(result.messages)
+          persistSessionPreviewCache(sessionId, result.messages)
           if (result.messages.length === 0) {
             setNoMessageTable(true)
             setHasMoreMessages(false)
@@ -1233,10 +1448,12 @@ function ChatPage(_props: ChatPageProps) {
     if (session.username === currentSessionId) return
     pendingSessionLoadRef.current = session.username
     setIsSessionSwitching(true)
-    setCurrentSession(session.username, { preserveMessages: true })
+    setCurrentSession(session.username, { preserveMessages: false })
+    void hydrateSessionPreview(session.username)
     setCurrentOffset(0)
     setJumpStartTime(0)
     setJumpEndTime(0)
+    setNoMessageTable(false)
     void loadMessages(session.username, 0, 0, 0)
     // 切换会话后回到正常聊天窗口：收起详情侧栏，详情需手动再次展开
     setShowDetailPanel(false)
@@ -1374,6 +1591,14 @@ function ChatPage(_props: ChatPageProps) {
     // 组件卸载时清理
     return () => {
       avatarLoadQueue.clear()
+      if (previewPersistTimerRef.current !== null) {
+        window.clearTimeout(previewPersistTimerRef.current)
+        previewPersistTimerRef.current = null
+      }
+      if (sessionListPersistTimerRef.current !== null) {
+        window.clearTimeout(sessionListPersistTimerRef.current)
+        sessionListPersistTimerRef.current = null
+      }
       if (contactUpdateTimerRef.current) {
         clearTimeout(contactUpdateTimerRef.current)
       }
@@ -1521,6 +1746,22 @@ function ChatPage(_props: ChatPageProps) {
   useEffect(() => {
     searchKeywordRef.current = searchKeyword
   }, [searchKeyword])
+
+  useEffect(() => {
+    if (!currentSessionId || !Array.isArray(messages) || messages.length === 0) return
+    persistSessionPreviewCache(currentSessionId, messages)
+  }, [currentSessionId, messages, persistSessionPreviewCache])
+
+  useEffect(() => {
+    if (!Array.isArray(sessions) || sessions.length === 0) return
+    if (sessionListPersistTimerRef.current !== null) {
+      window.clearTimeout(sessionListPersistTimerRef.current)
+    }
+    sessionListPersistTimerRef.current = window.setTimeout(() => {
+      persistSessionListCache(chatCacheScopeRef.current, sessions)
+      sessionListPersistTimerRef.current = null
+    }, 260)
+  }, [sessions, persistSessionListCache])
 
   // 普通视图：隐藏 isFolded 的群，保留 placeholder_foldgroup 入口
   useEffect(() => {
