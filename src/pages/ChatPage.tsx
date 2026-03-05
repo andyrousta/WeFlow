@@ -204,8 +204,13 @@ function formatYmdHmDateTime(timestamp?: number): string {
 interface ChatPageProps {
   standaloneSessionWindow?: boolean
   initialSessionId?: string | null
+  standaloneSource?: string | null
+  standaloneInitialDisplayName?: string | null
+  standaloneInitialAvatarUrl?: string | null
+  standaloneInitialContactType?: string | null
 }
 
+type StandaloneLoadStage = 'idle' | 'connecting' | 'loading' | 'ready'
 
 interface SessionDetail {
   wxid: string
@@ -408,8 +413,20 @@ const SessionItem = React.memo(function SessionItem({
 
 
 function ChatPage(props: ChatPageProps) {
-  const { standaloneSessionWindow = false, initialSessionId = null } = props
+  const {
+    standaloneSessionWindow = false,
+    initialSessionId = null,
+    standaloneSource = null,
+    standaloneInitialDisplayName = null,
+    standaloneInitialAvatarUrl = null,
+    standaloneInitialContactType = null
+  } = props
   const normalizedInitialSessionId = useMemo(() => String(initialSessionId || '').trim(), [initialSessionId])
+  const normalizedStandaloneSource = useMemo(() => String(standaloneSource || '').trim().toLowerCase(), [standaloneSource])
+  const normalizedStandaloneInitialDisplayName = useMemo(() => String(standaloneInitialDisplayName || '').trim(), [standaloneInitialDisplayName])
+  const normalizedStandaloneInitialAvatarUrl = useMemo(() => String(standaloneInitialAvatarUrl || '').trim(), [standaloneInitialAvatarUrl])
+  const normalizedStandaloneInitialContactType = useMemo(() => String(standaloneInitialContactType || '').trim().toLowerCase(), [standaloneInitialContactType])
+  const shouldHideStandaloneDetailButton = standaloneSessionWindow && normalizedStandaloneSource === 'export'
   const navigate = useNavigate()
 
   const {
@@ -493,7 +510,12 @@ function ChatPage(props: ChatPageProps) {
   const [hasInitialMessages, setHasInitialMessages] = useState(false)
   const [isSessionSwitching, setIsSessionSwitching] = useState(false)
   const [noMessageTable, setNoMessageTable] = useState(false)
-  const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(null)
+  const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(normalizedStandaloneInitialDisplayName || null)
+  const [fallbackAvatarUrl, setFallbackAvatarUrl] = useState<string | null>(normalizedStandaloneInitialAvatarUrl || null)
+  const [standaloneLoadStage, setStandaloneLoadStage] = useState<StandaloneLoadStage>(
+    standaloneSessionWindow && normalizedInitialSessionId ? 'connecting' : 'idle'
+  )
+  const [standaloneInitialLoadRequested, setStandaloneInitialLoadRequested] = useState(false)
   const [showVoiceTranscribeDialog, setShowVoiceTranscribeDialog] = useState(false)
   const [pendingVoiceTranscriptRequest, setPendingVoiceTranscriptRequest] = useState<{ sessionId: string; messageId: string } | null>(null)
   const [inProgressExportSessionIds, setInProgressExportSessionIds] = useState<Set<string>>(new Set())
@@ -2408,9 +2430,9 @@ function ChatPage(props: ChatPageProps) {
   }, [appendMessages, getMessageKey])
 
   // 选择会话
-  const selectSessionById = useCallback((sessionId: string) => {
+  const selectSessionById = useCallback((sessionId: string, options: { force?: boolean } = {}) => {
     const normalizedSessionId = String(sessionId || '').trim()
-    if (!normalizedSessionId || normalizedSessionId === currentSessionId) return
+    if (!normalizedSessionId || (!options.force && normalizedSessionId === currentSessionId)) return
     const switchRequestSeq = sessionSwitchRequestSeqRef.current + 1
     sessionSwitchRequestSeqRef.current = switchRequestSeq
 
@@ -2734,7 +2756,7 @@ function ChatPage(props: ChatPageProps) {
   }, [currentSessionId, messages.length, isLoadingMessages])
 
   useEffect(() => {
-    if (currentSessionId && messages.length === 0 && !isLoadingMessages && !isLoadingMore && !noMessageTable) {
+    if (currentSessionId && isConnected && messages.length === 0 && !isLoadingMessages && !isLoadingMore && !noMessageTable) {
       if (pendingSessionLoadRef.current === currentSessionId) return
       if (initialLoadRequestedSessionRef.current === currentSessionId) return
       initialLoadRequestedSessionRef.current = currentSessionId
@@ -2745,7 +2767,7 @@ function ChatPage(props: ChatPageProps) {
         forceInitialLimit: 30
       })
     }
-  }, [currentSessionId, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
+  }, [currentSessionId, isConnected, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
 
   useEffect(() => {
     return () => {
@@ -2906,7 +2928,21 @@ function ChatPage(props: ChatPageProps) {
   // 获取当前会话信息（从通讯录跳转时可能不在 sessions 列表中，构造 fallback）
   const currentSession = (() => {
     const found = Array.isArray(sessions) ? sessions.find(s => s.username === currentSessionId) : undefined
-    if (found || !currentSessionId) return found
+    if (found) {
+      if (
+        standaloneSessionWindow &&
+        normalizedInitialSessionId &&
+        found.username === normalizedInitialSessionId
+      ) {
+        return {
+          ...found,
+          displayName: found.displayName || fallbackDisplayName || found.username,
+          avatarUrl: found.avatarUrl || fallbackAvatarUrl || undefined
+        }
+      }
+      return found
+    }
+    if (!currentSessionId) return found
     return {
       username: currentSessionId,
       type: 0,
@@ -2916,6 +2952,7 @@ function ChatPage(props: ChatPageProps) {
       lastTimestamp: 0,
       lastMsgType: 0,
       displayName: fallbackDisplayName || currentSessionId,
+      avatarUrl: fallbackAvatarUrl || undefined,
     } as ChatSession
   })()
   const filteredGroupPanelMembers = useMemo(() => {
@@ -2935,20 +2972,106 @@ function ChatPage(props: ChatPageProps) {
   }, [groupMemberSearchKeyword, groupPanelMembers])
   const isCurrentSessionExporting = Boolean(currentSessionId && inProgressExportSessionIds.has(currentSessionId))
   const isExportActionBusy = isCurrentSessionExporting || isPreparingExportDialog
+  const isCurrentSessionGroup = Boolean(
+    currentSession && (
+      isGroupChatSession(currentSession.username) ||
+      (
+        standaloneSessionWindow &&
+        currentSession.username === normalizedInitialSessionId &&
+        normalizedStandaloneInitialContactType === 'group'
+      )
+    )
+  )
+
+  useEffect(() => {
+    if (!standaloneSessionWindow) return
+    setStandaloneInitialLoadRequested(false)
+    setStandaloneLoadStage(normalizedInitialSessionId ? 'connecting' : 'idle')
+    setFallbackDisplayName(normalizedStandaloneInitialDisplayName || null)
+    setFallbackAvatarUrl(normalizedStandaloneInitialAvatarUrl || null)
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialDisplayName,
+    normalizedStandaloneInitialAvatarUrl
+  ])
+
+  useEffect(() => {
+    if (!standaloneSessionWindow) return
+    if (!normalizedInitialSessionId) return
+
+    if (normalizedStandaloneInitialDisplayName) {
+      setFallbackDisplayName(normalizedStandaloneInitialDisplayName)
+    }
+    if (normalizedStandaloneInitialAvatarUrl) {
+      setFallbackAvatarUrl(normalizedStandaloneInitialAvatarUrl)
+    }
+
+    if (!currentSessionId) {
+      setCurrentSession(normalizedInitialSessionId, { preserveMessages: false })
+    }
+    if (!isConnected || isConnecting) {
+      setStandaloneLoadStage('connecting')
+    }
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialDisplayName,
+    normalizedStandaloneInitialAvatarUrl,
+    currentSessionId,
+    isConnected,
+    isConnecting,
+    setCurrentSession
+  ])
 
   useEffect(() => {
     if (!standaloneSessionWindow) return
     if (!normalizedInitialSessionId) return
     if (!isConnected || isConnecting) return
-    if (currentSessionId === normalizedInitialSessionId) return
-    selectSessionById(normalizedInitialSessionId)
+    if (currentSessionId === normalizedInitialSessionId && standaloneInitialLoadRequested) return
+    setStandaloneInitialLoadRequested(true)
+    setStandaloneLoadStage('loading')
+    selectSessionById(normalizedInitialSessionId, {
+      force: currentSessionId === normalizedInitialSessionId
+    })
   }, [
     standaloneSessionWindow,
     normalizedInitialSessionId,
     isConnected,
     isConnecting,
     currentSessionId,
+    standaloneInitialLoadRequested,
     selectSessionById
+  ])
+
+  useEffect(() => {
+    if (!standaloneSessionWindow || !normalizedInitialSessionId) return
+    if (!isConnected || isConnecting) {
+      setStandaloneLoadStage('connecting')
+      return
+    }
+    if (!standaloneInitialLoadRequested) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    if (currentSessionId !== normalizedInitialSessionId) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    if (isLoadingMessages || isSessionSwitching) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    setStandaloneLoadStage('ready')
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    isConnected,
+    isConnecting,
+    standaloneInitialLoadRequested,
+    currentSessionId,
+    isLoadingMessages,
+    isSessionSwitching
   ])
 
   // 从通讯录跳转时，会话不在列表中，主动加载联系人显示名称
@@ -2956,12 +3079,14 @@ function ChatPage(props: ChatPageProps) {
     if (!currentSessionId) return
     const found = Array.isArray(sessions) ? sessions.find(s => s.username === currentSessionId) : undefined
     if (found) {
-      setFallbackDisplayName(null)
+      if (found.displayName) setFallbackDisplayName(found.displayName)
+      if (found.avatarUrl) setFallbackAvatarUrl(found.avatarUrl)
       return
     }
     loadContactInfoBatch([currentSessionId]).then(() => {
       const cached = senderAvatarCache.get(currentSessionId)
       if (cached?.displayName) setFallbackDisplayName(cached.displayName)
+      if (cached?.avatarUrl) setFallbackAvatarUrl(cached.avatarUrl)
     })
   }, [currentSessionId, sessions])
 
@@ -3738,16 +3863,16 @@ function ChatPage(props: ChatPageProps) {
                 src={currentSession.avatarUrl}
                 name={currentSession.displayName || currentSession.username}
                 size={40}
-                className={isGroupChatSession(currentSession.username) ? 'group session-avatar' : 'session-avatar'}
+                className={isCurrentSessionGroup ? 'group session-avatar' : 'session-avatar'}
               />
               <div className="header-info">
                 <h3>{currentSession.displayName || currentSession.username}</h3>
-                {isGroupChatSession(currentSession.username) && (
+                {isCurrentSessionGroup && (
                   <div className="header-subtitle">群聊</div>
                 )}
               </div>
               <div className="header-actions">
-                {!standaloneSessionWindow && isGroupChatSession(currentSession.username) && (
+                {!standaloneSessionWindow && isCurrentSessionGroup && (
                   <button
                     className="icon-btn group-analytics-btn"
                     onClick={handleGroupAnalytics}
@@ -3756,7 +3881,7 @@ function ChatPage(props: ChatPageProps) {
                     <BarChart3 size={18} />
                   </button>
                 )}
-                {isGroupChatSession(currentSession.username) && (
+                {isCurrentSessionGroup && (
                   <button
                     className={`icon-btn group-members-btn ${showGroupMembersPanel ? 'active' : ''}`}
                     onClick={toggleGroupMembersPanel}
@@ -3863,13 +3988,15 @@ function ChatPage(props: ChatPageProps) {
                 >
                   <RefreshCw size={18} className={isRefreshingMessages ? 'spin' : ''} />
                 </button>
-                <button
-                  className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
-                  onClick={toggleDetailPanel}
-                  title="会话详情"
-                >
-                  <Info size={18} />
-                </button>
+                {!shouldHideStandaloneDetailButton && (
+                  <button
+                    className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
+                    onClick={toggleDetailPanel}
+                    title="会话详情"
+                  >
+                    <Info size={18} />
+                  </button>
+                )}
               </div>
             </div>
 
@@ -3881,6 +4008,13 @@ function ChatPage(props: ChatPageProps) {
             )}
 
             <div className={`message-content-wrapper ${hasInitialMessages ? 'loaded' : 'loading'} ${isSessionSwitching ? 'switching' : ''}`}>
+              {standaloneSessionWindow && standaloneLoadStage !== 'ready' && (
+                <div className="standalone-phase-overlay" role="status" aria-live="polite">
+                  <Loader2 size={22} className="spin" />
+                  <span>{standaloneLoadStage === 'connecting' ? '正在建立连接...' : '正在加载最近消息...'}</span>
+                  {connectionError && <small>{connectionError}</small>}
+                </div>
+              )}
               {isLoadingMessages && (!hasInitialMessages || isSessionSwitching) && (
                 <div className="loading-messages loading-overlay">
                   <Loader2 size={24} />
@@ -3937,7 +4071,7 @@ function ChatPage(props: ChatPageProps) {
                         session={currentSession}
                         showTime={!showDateDivider && showTime}
                         myAvatarUrl={myAvatarUrl}
-                        isGroupChat={isGroupChatSession(currentSession.username)}
+                        isGroupChat={isCurrentSessionGroup}
                         onRequireModelDownload={handleRequireModelDownload}
                         onContextMenu={handleContextMenu}
                         isSelectionMode={isSelectionMode}
@@ -3969,7 +4103,7 @@ function ChatPage(props: ChatPageProps) {
               </div>
 
               {/* 群成员面板 */}
-              {showGroupMembersPanel && isGroupChatSession(currentSession.username) && (
+              {showGroupMembersPanel && isCurrentSessionGroup && (
                 <div className="detail-panel group-members-panel">
                   <div className="detail-header">
                     <h4>群成员</h4>

@@ -5,6 +5,28 @@ import { ConfigService } from '../services/config'
 let notificationWindow: BrowserWindow | null = null
 let closeTimer: NodeJS.Timeout | null = null
 
+export function destroyNotificationWindow() {
+    if (closeTimer) {
+        clearTimeout(closeTimer)
+        closeTimer = null
+    }
+    lastNotificationData = null
+
+    if (!notificationWindow || notificationWindow.isDestroyed()) {
+        notificationWindow = null
+        return
+    }
+
+    const win = notificationWindow
+    notificationWindow = null
+
+    try {
+        win.destroy()
+    } catch (error) {
+        console.warn('[NotificationWindow] Failed to destroy window:', error)
+    }
+}
+
 export function createNotificationWindow() {
     if (notificationWindow && !notificationWindow.isDestroyed()) {
         return notificationWindow

@@ -164,6 +164,7 @@ interface ExportSessionStatsOptions {
   forceRefresh?: boolean
   allowStaleCache?: boolean
   preferAccurateSpecialTypes?: boolean
+  cacheOnly?: boolean
 }
 
 interface ExportSessionStatsCacheMeta {
@@ -5209,39 +5210,36 @@ class ChatService {
         return { success: true, detail: cachedDetail.detail }
       }
 
-      const [tableStatsResult, statsResult] = await Promise.allSettled([
-        wcdbService.getMessageTableStats(normalizedSessionId),
-        (async (): Promise<ExportSessionStats | null> => {
-          const cachedStats = this.getSessionStatsCacheEntry(normalizedSessionId)
-          if (cachedStats && this.supportsRequestedRelation(cachedStats.entry, false)) {
-            return this.fromSessionStatsCacheStats(cachedStats.entry.stats)
-          }
-          const myWxid = this.configService.get('myWxid') || ''
-          const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
-          const stats = await this.getOrComputeSessionExportStats(normalizedSessionId, false, selfIdentitySet)
-          this.setSessionStatsCacheEntry(normalizedSessionId, stats, false)
-          return stats
-        })()
-      ])
-
-      const statsSnapshot = statsResult.status === 'fulfilled'
-        ? statsResult.value
-        : null
-      const firstMessageTime = statsSnapshot && Number.isFinite(statsSnapshot.firstTimestamp)
-        ? Math.max(0, Math.floor(statsSnapshot.firstTimestamp as number))
-        : undefined
-      const latestMessageTime = statsSnapshot && Number.isFinite(statsSnapshot.lastTimestamp)
-        ? Math.max(0, Math.floor(statsSnapshot.lastTimestamp as number))
-        : undefined
+      const tableStatsResult = await wcdbService.getMessageTableStats(normalizedSessionId)
 
       const messageTables: { dbName: string; tableName: string; count: number }[] = []
-      if (tableStatsResult.status === 'fulfilled' && tableStatsResult.value.success && tableStatsResult.value.tables) {
-        for (const row of tableStatsResult.value.tables) {
+      let firstMessageTime: number | undefined
+      let latestMessageTime: number | undefined
+      if (tableStatsResult.success && tableStatsResult.tables) {
+        for (const row of tableStatsResult.tables) {
           messageTables.push({
             dbName: basename(row.db_path || ''),
             tableName: row.table_name || '',
             count: parseInt(row.count || '0', 10)
           })
+
+          const firstTs = this.getRowInt(
+            row,
+            ['first_timestamp', 'firstTimestamp', 'first_time', 'firstTime', 'min_create_time', 'minCreateTime'],
+            0
+          )
+          if (firstTs > 0 && (firstMessageTime === undefined || firstTs < firstMessageTime)) {
+            firstMessageTime = firstTs
+          }
+
+          const lastTs = this.getRowInt(
+            row,
+            ['last_timestamp', 'lastTimestamp', 'last_time', 'lastTime', 'max_create_time', 'maxCreateTime'],
+            0
+          )
+          if (lastTs > 0 && (latestMessageTime === undefined || lastTs > latestMessageTime)) {
+            latestMessageTime = lastTs
+          }
         }
       }
 
@@ -5357,6 +5355,7 @@ class ChatService {
       const forceRefresh = options.forceRefresh === true
       const allowStaleCache = options.allowStaleCache === true
       const preferAccurateSpecialTypes = options.preferAccurateSpecialTypes === true
+      const cacheOnly = options.cacheOnly === true
 
       const normalizedSessionIds = Array.from(
         new Set(
@@ -5380,31 +5379,33 @@ class ChatService {
           ? this.getGroupMyMessageCountHintEntry(sessionId)
           : null
         const cachedResult = this.getSessionStatsCacheEntry(sessionId)
-        if (!forceRefresh && !preferAccurateSpecialTypes) {
-          if (cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
-            const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
-            if (!stale || allowStaleCache) {
-              resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
-              if (groupMyMessagesHint && Number.isFinite(groupMyMessagesHint.entry.messageCount)) {
-                resultMap[sessionId].groupMyMessages = groupMyMessagesHint.entry.messageCount
-              }
-              cacheMeta[sessionId] = {
-                updatedAt: cachedResult.entry.updatedAt,
-                stale,
-                includeRelations: cachedResult.entry.includeRelations,
-                source: cachedResult.source
-              }
-              if (stale) {
-                needsRefreshSet.add(sessionId)
-              }
-              continue
+        const canUseCache = cacheOnly || (!forceRefresh && !preferAccurateSpecialTypes)
+        if (canUseCache && cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
+          const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
+          if (!stale || allowStaleCache || cacheOnly) {
+            resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
+            if (groupMyMessagesHint && Number.isFinite(groupMyMessagesHint.entry.messageCount)) {
+              resultMap[sessionId].groupMyMessages = groupMyMessagesHint.entry.messageCount
             }
-          }
-          // allowStaleCache 仅对“已有缓存”生效；无缓存会话仍需进入计算流程。
-          if (allowStaleCache && cachedResult) {
-            needsRefreshSet.add(sessionId)
+            cacheMeta[sessionId] = {
+              updatedAt: cachedResult.entry.updatedAt,
+              stale,
+              includeRelations: cachedResult.entry.includeRelations,
+              source: cachedResult.source
+            }
+            if (stale) {
+              needsRefreshSet.add(sessionId)
+            }
             continue
           }
+        }
+        // allowStaleCache/cacheOnly 仅对“已有缓存”生效；无缓存会话不会直接算重查询。
+        if (canUseCache && allowStaleCache && cachedResult) {
+          needsRefreshSet.add(sessionId)
+          continue
+        }
+        if (cacheOnly) {
+          continue
         }
         pendingSessionIds.push(sessionId)
       }

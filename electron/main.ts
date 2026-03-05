@@ -24,7 +24,7 @@ import { windowsHelloService } from './services/windowsHelloService'
 import { exportCardDiagnosticsService } from './services/exportCardDiagnosticsService'
 import { cloudControlService } from './services/cloudControlService'
 
-import { registerNotificationHandlers, showNotification } from './windows/notificationWindow'
+import { destroyNotificationWindow, registerNotificationHandlers, showNotification } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
 
 
@@ -87,10 +87,12 @@ let onboardingWindow: BrowserWindow | null = null
 // Splash 启动窗口
 let splashWindow: BrowserWindow | null = null
 const sessionChatWindows = new Map<string, BrowserWindow>()
+const sessionChatWindowSources = new Map<string, 'chat' | 'export'>()
 const keyService = new KeyService()
 
 let mainWindowReady = false
 let shouldShowMain = true
+let isAppQuitting = false
 
 // 更新下载状态管理（Issue #294 修复）
 let isDownloadInProgress = false
@@ -121,6 +123,47 @@ interface AnnualReportYearsTaskState {
   done: boolean
   snapshot: AnnualReportYearsProgressPayload
   updatedAt: number
+}
+
+interface OpenSessionChatWindowOptions {
+  source?: 'chat' | 'export'
+  initialDisplayName?: string
+  initialAvatarUrl?: string
+  initialContactType?: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+}
+
+const normalizeSessionChatWindowSource = (source: unknown): 'chat' | 'export' => {
+  return String(source || '').trim().toLowerCase() === 'export' ? 'export' : 'chat'
+}
+
+const normalizeSessionChatWindowOptionString = (value: unknown): string => {
+  return String(value || '').trim()
+}
+
+const loadSessionChatWindowContent = (
+  win: BrowserWindow,
+  sessionId: string,
+  source: 'chat' | 'export',
+  options?: OpenSessionChatWindowOptions
+) => {
+  const queryParams = new URLSearchParams({
+    sessionId,
+    source
+  })
+  const initialDisplayName = normalizeSessionChatWindowOptionString(options?.initialDisplayName)
+  const initialAvatarUrl = normalizeSessionChatWindowOptionString(options?.initialAvatarUrl)
+  const initialContactType = normalizeSessionChatWindowOptionString(options?.initialContactType)
+  if (initialDisplayName) queryParams.set('initialDisplayName', initialDisplayName)
+  if (initialAvatarUrl) queryParams.set('initialAvatarUrl', initialAvatarUrl)
+  if (initialContactType) queryParams.set('initialContactType', initialContactType)
+  const query = queryParams.toString()
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${query}`)
+    return
+  }
+  win.loadFile(join(__dirname, '../dist/index.html'), {
+    hash: `/chat-window?${query}`
+  })
 }
 
 const annualReportYearsLoadTasks = new Map<string, AnnualReportYearsTaskState>()
@@ -288,6 +331,21 @@ function createWindow(options: { autoShow?: boolean } = {}) {
       }
     } catch {}
     callback(false)
+  })
+
+  win.on('closed', () => {
+    if (mainWindow !== win) return
+
+    mainWindow = null
+    mainWindowReady = false
+
+    if (process.platform !== 'darwin' && !isAppQuitting) {
+      // 隐藏通知窗也是 BrowserWindow，必须销毁，否则会阻止应用退出。
+      destroyNotificationWindow()
+      if (BrowserWindow.getAllWindows().length === 0) {
+        app.quit()
+      }
+    }
   })
 
   return win
@@ -688,12 +746,18 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
 /**
  * 创建独立的会话聊天窗口（单会话，复用聊天页右侧消息区域）
  */
-function createSessionChatWindow(sessionId: string) {
+function createSessionChatWindow(sessionId: string, options?: OpenSessionChatWindowOptions) {
   const normalizedSessionId = String(sessionId || '').trim()
   if (!normalizedSessionId) return null
+  const normalizedSource = normalizeSessionChatWindowSource(options?.source)
 
   const existing = sessionChatWindows.get(normalizedSessionId)
   if (existing && !existing.isDestroyed()) {
+    const trackedSource = sessionChatWindowSources.get(normalizedSessionId) || 'chat'
+    if (trackedSource !== normalizedSource) {
+      loadSessionChatWindowContent(existing, normalizedSessionId, normalizedSource, options)
+      sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
+    }
     if (existing.isMinimized()) {
       existing.restore()
     }
@@ -730,10 +794,9 @@ function createSessionChatWindow(sessionId: string) {
     autoHideMenuBar: true
   })
 
-  const sessionParam = `sessionId=${encodeURIComponent(normalizedSessionId)}`
-  if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${sessionParam}`)
+  loadSessionChatWindowContent(win, normalizedSessionId, normalizedSource, options)
 
+  if (process.env.VITE_DEV_SERVER_URL) {
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
         if (win.webContents.isDevToolsOpened()) {
@@ -743,10 +806,6 @@ function createSessionChatWindow(sessionId: string) {
         }
         event.preventDefault()
       }
-    })
-  } else {
-    win.loadFile(join(__dirname, '../dist/index.html'), {
-      hash: `/chat-window?${sessionParam}`
     })
   }
 
@@ -759,10 +818,12 @@ function createSessionChatWindow(sessionId: string) {
     const tracked = sessionChatWindows.get(normalizedSessionId)
     if (tracked === win) {
       sessionChatWindows.delete(normalizedSessionId)
+      sessionChatWindowSources.delete(normalizedSessionId)
     }
   })
 
   sessionChatWindows.set(normalizedSessionId, win)
+  sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
   return win
 }
 
@@ -1071,8 +1132,8 @@ function registerIpcHandlers() {
   })
 
   // 打开会话聊天窗口（同会话仅保留一个窗口并聚焦）
-  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string) => {
-    const win = createSessionChatWindow(sessionId)
+  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string, options?: OpenSessionChatWindowOptions) => {
+    const win = createSessionChatWindow(sessionId, options)
     return Boolean(win)
   })
 
@@ -1410,6 +1471,7 @@ function registerIpcHandlers() {
     forceRefresh?: boolean
     allowStaleCache?: boolean
     preferAccurateSpecialTypes?: boolean
+    cacheOnly?: boolean
   }) => {
     return chatService.getExportSessionStats(sessionIds, options)
   })
@@ -1463,12 +1525,20 @@ function registerIpcHandlers() {
     return snsService.getSnsUsernames()
   })
 
+  ipcMain.handle('sns:getUserPostCounts', async () => {
+    return snsService.getUserPostCounts()
+  })
+
   ipcMain.handle('sns:getExportStats', async () => {
     return snsService.getExportStats()
   })
 
   ipcMain.handle('sns:getExportStatsFast', async () => {
     return snsService.getExportStatsFast()
+  })
+
+  ipcMain.handle('sns:getUserPostStats', async (_, username: string) => {
+    return snsService.getUserPostStats(username)
   })
 
   ipcMain.handle('sns:debugResource', async (_, url: string) => {
@@ -2373,6 +2443,9 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', async () => {
+  isAppQuitting = true
+  // 通知窗使用 hide 而非 close，退出时主动销毁，避免残留窗口阻塞进程退出。
+  destroyNotificationWindow()
   // 停止 HTTP 服务器，释放 TCP 端口占用，避免进程无法退出
   try { await httpService.stop() } catch {}
   // 终止 wcdb Worker 线程，避免线程阻止进程退出

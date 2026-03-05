@@ -41,6 +41,7 @@ export const CONFIG_KEYS = {
   EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
   EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP: 'exportSessionContentMetricCacheMap',
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
+  EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP: 'exportSnsUserPostCountsCacheMap',
   SNS_PAGE_CACHE_MAP: 'snsPageCacheMap',
   CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
   CONTACTS_LIST_CACHE_MAP: 'contactsListCacheMap',
@@ -533,6 +534,11 @@ export interface ExportSnsStatsCacheItem {
   totalFriends: number
 }
 
+export interface ExportSnsUserPostCountsCacheItem {
+  updatedAt: number
+  counts: Record<string, number>
+}
+
 export interface SnsPageOverviewCache {
   totalPosts: number
   totalFriends: number
@@ -738,6 +744,58 @@ export async function setExportSnsStatsCache(
   }
 
   await config.set(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP, map)
+}
+
+export async function getExportSnsUserPostCountsCache(scopeKey: string): Promise<ExportSnsUserPostCountsCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const raw = rawItem as Record<string, unknown>
+  const rawCounts = raw.counts
+  if (!rawCounts || typeof rawCounts !== 'object') return null
+
+  const counts: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(rawCounts as Record<string, unknown>)) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    counts[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? raw.updatedAt
+    : 0
+  return { updatedAt, counts }
+}
+
+export async function setExportSnsUserPostCountsCache(
+  scopeKey: string,
+  counts: Record<string, number>
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(counts || {})) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    normalized[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    counts: normalized
+  }
+
+  await config.set(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP, map)
 }
 
 export async function getSnsPageCache(scopeKey: string): Promise<SnsPageCacheItem | null> {

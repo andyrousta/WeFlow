@@ -402,8 +402,22 @@ function App() {
 
   // 独立会话聊天窗口（仅显示聊天内容区域）
   if (isStandaloneChatWindow) {
-    const sessionId = new URLSearchParams(location.search).get('sessionId') || ''
-    return <ChatPage standaloneSessionWindow initialSessionId={sessionId} />
+    const params = new URLSearchParams(location.search)
+    const sessionId = params.get('sessionId') || ''
+    const standaloneSource = params.get('source')
+    const standaloneInitialDisplayName = params.get('initialDisplayName')
+    const standaloneInitialAvatarUrl = params.get('initialAvatarUrl')
+    const standaloneInitialContactType = params.get('initialContactType')
+    return (
+      <ChatPage
+        standaloneSessionWindow
+        initialSessionId={sessionId}
+        standaloneSource={standaloneSource}
+        standaloneInitialDisplayName={standaloneInitialDisplayName}
+        standaloneInitialAvatarUrl={standaloneInitialAvatarUrl}
+        standaloneInitialContactType={standaloneInitialContactType}
+      />
+    )
   }
 
   // 独立通知窗口

@@ -1,5 +1,5 @@
-import React, { useState } from 'react'
-import { Search, Calendar, User, X, Filter, Check } from 'lucide-react'
+import React from 'react'
+import { Search, Calendar, User, X, Loader2 } from 'lucide-react'
 import { Avatar } from '../Avatar'
 // import JumpToDateDialog from '../JumpToDateDialog' // Assuming this is imported from parent or moved
 
@@ -7,6 +7,14 @@ interface Contact {
     username: string
     displayName: string
     avatarUrl?: string
+    postCount?: number
+    postCountStatus?: 'idle' | 'loading' | 'ready'
+}
+
+interface ContactsCountProgress {
+    resolved: number
+    total: number
+    running: boolean
 }
 
 interface SnsFilterPanelProps {
@@ -21,6 +29,7 @@ interface SnsFilterPanelProps {
     contactSearch: string
     setContactSearch: (val: string) => void
     loading?: boolean
+    contactsCountProgress?: ContactsCountProgress
 }
 
 export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
@@ -34,11 +43,12 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
     contacts,
     contactSearch,
     setContactSearch,
-    loading
+    loading,
+    contactsCountProgress
 }) => {
 
     const filteredContacts = contacts.filter(c =>
-        c.displayName.toLowerCase().includes(contactSearch.toLowerCase()) ||
+        (c.displayName || '').toLowerCase().includes(contactSearch.toLowerCase()) ||
         c.username.toLowerCase().includes(contactSearch.toLowerCase())
     )
 
@@ -152,8 +162,17 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                         )}
                     </div>
 
+                    {contactsCountProgress && contactsCountProgress.total > 0 && (
+                        <div className="contact-count-progress">
+                            {contactsCountProgress.running
+                                ? `朋友圈条数统计中 ${contactsCountProgress.resolved}/${contactsCountProgress.total}`
+                                : `朋友圈条数已统计 ${contactsCountProgress.total}/${contactsCountProgress.total}`}
+                        </div>
+                    )}
+
                     <div className="contact-list-scroll">
                         {filteredContacts.map(contact => {
+                            const isPostCountReady = contact.postCountStatus === 'ready'
                             return (
                             <div
                                 key={contact.username}
@@ -163,6 +182,15 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                                 <Avatar src={contact.avatarUrl} name={contact.displayName} size={36} shape="rounded" />
                                 <div className="contact-meta">
                                     <span className="contact-name">{contact.displayName}</span>
+                                </div>
+                                <div className="contact-post-count-wrap">
+                                    {isPostCountReady ? (
+                                        <span className="contact-post-count">{Math.max(0, Math.floor(Number(contact.postCount || 0)))}条</span>
+                                    ) : (
+                                        <span className="contact-post-count-loading" title="统计中">
+                                            <Loader2 size={13} className="spinning" />
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                             )

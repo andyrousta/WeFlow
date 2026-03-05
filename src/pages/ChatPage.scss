@@ -1783,6 +1783,30 @@
   z-index: 2;
 }
 
+.standalone-phase-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: color-mix(in srgb, var(--bg-tertiary) 82%, transparent);
+  color: var(--text-secondary);
+  font-size: 14px;
+  pointer-events: none;
+
+  .spin {
+    animation: spin 1s linear infinite;
+  }
+
+  small {
+    color: var(--text-tertiary);
+    font-size: 12px;
+  }
+}
+
 .empty-chat-inline {
   display: flex;
   flex-direction: column;

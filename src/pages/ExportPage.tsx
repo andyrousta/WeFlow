@@ -38,6 +38,8 @@ import {
   onOpenSingleExport
 } from '../services/exportBridge'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
+import { SnsPostItem } from '../components/Sns/SnsPostItem'
+import type { SnsPost } from '../types/sns'
 import './ExportPage.scss'
 
 type ConversationTab = 'private' | 'group' | 'official' | 'former_friend'
@@ -45,6 +47,7 @@ type TaskStatus = 'queued' | 'running' | 'success' | 'error'
 type TaskScope = 'single' | 'multi' | 'content' | 'sns'
 type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji'
 type ContentCardType = ContentType | 'sns'
+type SnsRankMode = 'likes' | 'comments'
 
 type SessionLayout = 'shared' | 'per-session'
 
@@ -163,12 +166,27 @@ interface TimeRangeDialogDraft {
 }
 
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
+const DETAIL_PRECISE_REFRESH_COOLDOWN_MS = 10 * 60 * 1000
+const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
+const SESSION_MEDIA_METRIC_BATCH_SIZE = 12
+const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
+const SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS = 120
+const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
+const SNS_USER_POST_COUNT_BATCH_SIZE = 12
+const SNS_USER_POST_COUNT_BATCH_INTERVAL_MS = 120
 const contentTypeLabels: Record<ContentType, string> = {
   text: '聊天文本',
   voice: '语音',
   image: '图片',
   video: '视频',
   emoji: '表情包'
+}
+
+const conversationTabLabels: Record<ConversationTab, string> = {
+  private: '私聊',
+  group: '群聊',
+  official: '公众号',
+  former_friend: '曾经的好友'
 }
 
 const getContentTypeLabel = (type: ContentType): string => {
@@ -409,6 +427,14 @@ const formatYmdHmDateTime = (timestamp?: number): string => {
   return `${y}-${m}-${day} ${h}:${min}`
 }
 
+const isSingleContactSession = (sessionId: string): boolean => {
+  const normalized = String(sessionId || '').trim()
+  if (!normalized) return false
+  if (normalized.includes('@chatroom')) return false
+  if (normalized.startsWith('gh_')) return false
+  return true
+}
+
 const formatPathBrief = (value: string, maxLength = 52): string => {
   const normalized = String(value || '')
   if (normalized.length <= maxLength) return normalized
@@ -573,6 +599,10 @@ const isContentScopeSession = (session: SessionRow): boolean => (
   session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
 )
 
+const isExportConversationSession = (session: SessionRow): boolean => (
+  session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
+)
+
 const exportKindPriority: Record<ConversationTab, number> = {
   private: 0,
   group: 1,
@@ -648,6 +678,12 @@ interface SessionDetail {
   messageTables: { dbName: string; tableName: string; count: number }[]
 }
 
+interface SessionSnsTimelineTarget {
+  username: string
+  displayName: string
+  avatarUrl?: string
+}
+
 interface SessionExportMetric {
   totalMessages: number
   voiceMessages: number
@@ -682,6 +718,30 @@ interface SessionExportCacheMeta {
   stale: boolean
   includeRelations: boolean
   source: 'memory' | 'disk' | 'fresh'
+}
+
+type SessionLoadStageStatus = 'pending' | 'loading' | 'done' | 'failed'
+
+interface SessionLoadStageState {
+  status: SessionLoadStageStatus
+  startedAt?: number
+  finishedAt?: number
+  error?: string
+}
+
+interface SessionLoadTraceState {
+  messageCount: SessionLoadStageState
+  mediaMetrics: SessionLoadStageState
+  snsPostCounts: SessionLoadStageState
+}
+
+interface SessionLoadStageSummary {
+  total: number
+  loaded: number
+  statusLabel: string
+  startedAt?: number
+  finishedAt?: number
+  latestProgressAt?: number
 }
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
@@ -868,6 +928,48 @@ const normalizeMessageCount = (value: unknown): number | undefined => {
   if (!Number.isFinite(parsed) || parsed < 0) return undefined
   return Math.floor(parsed)
 }
+
+const pickSessionMediaMetric = (
+  metricRaw: SessionExportMetric | SessionContentMetric | undefined
+): SessionContentMetric | null => {
+  if (!metricRaw) return null
+  const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
+  const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
+  const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
+  const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+  if (
+    typeof voiceMessages !== 'number' &&
+    typeof imageMessages !== 'number' &&
+    typeof videoMessages !== 'number' &&
+    typeof emojiMessages !== 'number'
+  ) {
+    return null
+  }
+  return {
+    voiceMessages,
+    imageMessages,
+    videoMessages,
+    emojiMessages
+  }
+}
+
+const hasCompleteSessionMediaMetric = (metricRaw: SessionContentMetric | undefined): boolean => {
+  if (!metricRaw) return false
+  return (
+    typeof normalizeMessageCount(metricRaw.voiceMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.imageMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.videoMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.emojiMessages) === 'number'
+  )
+}
+
+const createDefaultSessionLoadStage = (): SessionLoadStageState => ({ status: 'pending' })
+
+const createDefaultSessionLoadTrace = (): SessionLoadTraceState => ({
+  messageCount: createDefaultSessionLoadStage(),
+  mediaMetrics: createDefaultSessionLoadStage(),
+  snsPostCounts: createDefaultSessionLoadStage()
+})
 
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
   writeLayout,
@@ -1208,19 +1310,33 @@ function ExportPage() {
   const [avatarCacheUpdatedAt, setAvatarCacheUpdatedAt] = useState<number | null>(null)
   const [sessionMessageCounts, setSessionMessageCounts] = useState<Record<string, number>>({})
   const [isLoadingSessionCounts, setIsLoadingSessionCounts] = useState(false)
+  const [isSessionCountStageReady, setIsSessionCountStageReady] = useState(false)
   const [sessionContentMetrics, setSessionContentMetrics] = useState<Record<string, SessionContentMetric>>({})
+  const [sessionLoadTraceMap, setSessionLoadTraceMap] = useState<Record<string, SessionLoadTraceState>>({})
+  const [sessionLoadProgressPulseMap, setSessionLoadProgressPulseMap] = useState<Record<string, { at: number; delta: number }>>({})
   const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
   const [contactsLoadSession, setContactsLoadSession] = useState<ContactsLoadSession | null>(null)
   const [contactsLoadIssue, setContactsLoadIssue] = useState<ContactsLoadIssue | null>(null)
   const [showContactsDiagnostics, setShowContactsDiagnostics] = useState(false)
   const [contactsDiagnosticTick, setContactsDiagnosticTick] = useState(Date.now())
   const [showSessionDetailPanel, setShowSessionDetailPanel] = useState(false)
+  const [showSessionLoadDetailModal, setShowSessionLoadDetailModal] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingSessionDetail, setIsLoadingSessionDetail] = useState(false)
   const [isLoadingSessionDetailExtra, setIsLoadingSessionDetailExtra] = useState(false)
   const [isRefreshingSessionDetailStats, setIsRefreshingSessionDetailStats] = useState(false)
   const [isLoadingSessionRelationStats, setIsLoadingSessionRelationStats] = useState(false)
   const [copiedDetailField, setCopiedDetailField] = useState<string | null>(null)
+  const [snsUserPostCounts, setSnsUserPostCounts] = useState<Record<string, number>>({})
+  const [snsUserPostCountsStatus, setSnsUserPostCountsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [sessionSnsTimelineTarget, setSessionSnsTimelineTarget] = useState<SessionSnsTimelineTarget | null>(null)
+  const [sessionSnsTimelinePosts, setSessionSnsTimelinePosts] = useState<SnsPost[]>([])
+  const [sessionSnsTimelineLoading, setSessionSnsTimelineLoading] = useState(false)
+  const [sessionSnsTimelineLoadingMore, setSessionSnsTimelineLoadingMore] = useState(false)
+  const [sessionSnsTimelineHasMore, setSessionSnsTimelineHasMore] = useState(false)
+  const [sessionSnsTimelineTotalPosts, setSessionSnsTimelineTotalPosts] = useState<number | null>(null)
+  const [sessionSnsTimelineStatsLoading, setSessionSnsTimelineStatsLoading] = useState(false)
+  const [sessionSnsRankMode, setSessionSnsRankMode] = useState<SnsRankMode | null>(null)
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('B')
@@ -1298,6 +1414,7 @@ function ExportPage() {
   const sessionTableSectionRef = useRef<HTMLDivElement | null>(null)
   const detailRequestSeqRef = useRef(0)
   const sessionsRef = useRef<SessionRow[]>([])
+  const sessionContentMetricsRef = useRef<Record<string, SessionContentMetric>>({})
   const contactsListSizeRef = useRef(0)
   const contactsUpdatedAtRef = useRef<number | null>(null)
   const sessionsHydratedAtRef = useRef(0)
@@ -1306,7 +1423,29 @@ function ExportPage() {
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
   const sessionCountRequestIdRef = useRef(0)
+  const isLoadingSessionCountsRef = useRef(false)
   const activeTabRef = useRef<ConversationTab>('private')
+  const detailStatsPriorityRef = useRef(false)
+  const sessionSnsTimelinePostsRef = useRef<SnsPost[]>([])
+  const sessionSnsTimelineLoadingRef = useRef(false)
+  const sessionSnsTimelineRequestTokenRef = useRef(0)
+  const snsUserPostCountsHydrationTokenRef = useRef(0)
+  const snsUserPostCountsBatchTimerRef = useRef<number | null>(null)
+  const sessionPreciseRefreshAtRef = useRef<Record<string, number>>({})
+  const sessionLoadProgressSnapshotRef = useRef<Record<string, { loaded: number; total: number }>>({})
+  const sessionMediaMetricQueueRef = useRef<string[]>([])
+  const sessionMediaMetricQueuedSetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricLoadingSetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricReadySetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricRunIdRef = useRef(0)
+  const sessionMediaMetricWorkerRunningRef = useRef(false)
+  const sessionMediaMetricBackgroundFeedTimerRef = useRef<number | null>(null)
+  const sessionMediaMetricPersistTimerRef = useRef<number | null>(null)
+  const sessionMediaMetricPendingPersistRef = useRef<Record<string, configService.ExportSessionContentMetricCacheEntry>>({})
+  const sessionMediaMetricVisibleRangeRef = useRef<{ startIndex: number; endIndex: number }>({
+    startIndex: 0,
+    endIndex: -1
+  })
 
   const ensureExportCacheScope = useCallback(async (): Promise<string> => {
     if (exportCacheScopeReadyRef.current) {
@@ -1355,6 +1494,104 @@ function ExportPage() {
   useEffect(() => {
     contactsLoadTimeoutMsRef.current = contactsLoadTimeoutMs
   }, [contactsLoadTimeoutMs])
+
+  useEffect(() => {
+    isLoadingSessionCountsRef.current = isLoadingSessionCounts
+  }, [isLoadingSessionCounts])
+
+  useEffect(() => {
+    sessionContentMetricsRef.current = sessionContentMetrics
+  }, [sessionContentMetrics])
+
+  const patchSessionLoadTraceStage = useCallback((
+    sessionIds: string[],
+    stageKey: keyof SessionLoadTraceState,
+    status: SessionLoadStageStatus,
+    options?: { force?: boolean; error?: string }
+  ) => {
+    if (sessionIds.length === 0) return
+    const now = Date.now()
+    setSessionLoadTraceMap(prev => {
+      let changed = false
+      const next = { ...prev }
+      for (const sessionIdRaw of sessionIds) {
+        const sessionId = String(sessionIdRaw || '').trim()
+        if (!sessionId) continue
+        const prevTrace = next[sessionId] || createDefaultSessionLoadTrace()
+        const prevStage = prevTrace[stageKey] || createDefaultSessionLoadStage()
+        if (!options?.force && prevStage.status === 'done' && status !== 'done') {
+          continue
+        }
+        let stageChanged = false
+        const nextStage: SessionLoadStageState = { ...prevStage }
+        if (nextStage.status !== status) {
+          nextStage.status = status
+          stageChanged = true
+        }
+        if (status === 'loading') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (nextStage.finishedAt) {
+            nextStage.finishedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.error) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        } else if (status === 'done') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (!nextStage.finishedAt) {
+            nextStage.finishedAt = now
+            stageChanged = true
+          }
+          if (nextStage.error) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        } else if (status === 'failed') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (!nextStage.finishedAt) {
+            nextStage.finishedAt = now
+            stageChanged = true
+          }
+          const nextError = options?.error || '加载失败'
+          if (nextStage.error !== nextError) {
+            nextStage.error = nextError
+            stageChanged = true
+          }
+        } else if (status === 'pending') {
+          if (nextStage.startedAt !== undefined) {
+            nextStage.startedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.finishedAt !== undefined) {
+            nextStage.finishedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.error !== undefined) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        }
+        if (!stageChanged) continue
+        next[sessionId] = {
+          ...prevTrace,
+          [stageKey]: nextStage
+        }
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [])
 
   const loadContactsList = useCallback(async (options?: { scopeKey?: string }) => {
     const scopeKey = options?.scopeKey || await ensureExportCacheScope()
@@ -1577,6 +1814,10 @@ function ExportPage() {
     hasSeededSnsStatsRef.current = hasSeededSnsStats
   }, [hasSeededSnsStats])
 
+  useEffect(() => {
+    sessionSnsTimelinePostsRef.current = sessionSnsTimelinePosts
+  }, [sessionSnsTimelinePosts])
+
   const preselectSessionIds = useMemo(() => {
     const state = location.state as { preselectSessionIds?: unknown; preselectSessionId?: unknown } | null
     const rawList = Array.isArray(state?.preselectSessionIds)
@@ -1722,6 +1963,346 @@ function ExportPage() {
     }
   }, [])
 
+  const loadSnsUserPostCounts = useCallback(async (options?: { force?: boolean }) => {
+    if (snsUserPostCountsStatus === 'loading') return
+    if (!options?.force && snsUserPostCountsStatus === 'ready') return
+
+    const targetSessionIds = sessionsRef.current
+      .filter((session) => session.hasSession && isSingleContactSession(session.username))
+      .map((session) => session.username)
+
+    snsUserPostCountsHydrationTokenRef.current += 1
+    const runToken = snsUserPostCountsHydrationTokenRef.current
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+
+    if (targetSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+
+    const scopeKey = exportCacheScopeReadyRef.current
+      ? exportCacheScopeRef.current
+      : await ensureExportCacheScope()
+    const targetSet = new Set(targetSessionIds)
+    let cachedCounts: Record<string, number> = {}
+    try {
+      const cached = await configService.getExportSnsUserPostCountsCache(scopeKey)
+      cachedCounts = cached?.counts || {}
+    } catch (cacheError) {
+      console.error('读取导出页朋友圈条数缓存失败:', cacheError)
+    }
+
+    const cachedTargetCounts = Object.entries(cachedCounts).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+      if (!targetSet.has(sessionId)) return acc
+      const nextCount = Number(countRaw)
+      acc[sessionId] = Number.isFinite(nextCount) ? Math.max(0, Math.floor(nextCount)) : 0
+      return acc
+    }, {})
+    const cachedReadySessionIds = Object.keys(cachedTargetCounts)
+    if (cachedReadySessionIds.length > 0) {
+      setSnsUserPostCounts(prev => ({ ...prev, ...cachedTargetCounts }))
+      patchSessionLoadTraceStage(cachedReadySessionIds, 'snsPostCounts', 'done')
+    }
+
+    const pendingSessionIds = options?.force
+      ? targetSessionIds
+      : targetSessionIds.filter((sessionId) => !(sessionId in cachedTargetCounts))
+    if (pendingSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+
+    patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'pending', { force: true })
+    patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'loading')
+    setSnsUserPostCountsStatus('loading')
+
+    let normalizedCounts: Record<string, number> = {}
+    try {
+      const result = await window.electronAPI.sns.getUserPostCounts()
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      if (!result.success || !result.counts) {
+        patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'failed', {
+          error: result.error || '朋友圈条数统计失败'
+        })
+        setSnsUserPostCountsStatus('error')
+        return
+      }
+
+      for (const [rawUsername, rawCount] of Object.entries(result.counts)) {
+        const username = String(rawUsername || '').trim()
+        if (!username) continue
+        const value = Number(rawCount)
+        normalizedCounts[username] = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+      }
+
+      void (async () => {
+        try {
+          await configService.setExportSnsUserPostCountsCache(scopeKey, normalizedCounts)
+        } catch (cacheError) {
+          console.error('写入导出页朋友圈条数缓存失败:', cacheError)
+        }
+      })()
+    } catch (error) {
+      console.error('加载朋友圈用户条数失败:', error)
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+      patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'failed', {
+        error: String(error)
+      })
+      setSnsUserPostCountsStatus('error')
+      return
+    }
+
+    let cursor = 0
+    const applyBatch = () => {
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      const batchSessionIds = pendingSessionIds.slice(cursor, cursor + SNS_USER_POST_COUNT_BATCH_SIZE)
+      if (batchSessionIds.length === 0) {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+        return
+      }
+
+      const batchCounts: Record<string, number> = {}
+      for (const sessionId of batchSessionIds) {
+        const nextCount = normalizedCounts[sessionId]
+        batchCounts[sessionId] = Number.isFinite(nextCount) ? Math.max(0, Math.floor(nextCount)) : 0
+      }
+
+      setSnsUserPostCounts(prev => ({ ...prev, ...batchCounts }))
+      patchSessionLoadTraceStage(batchSessionIds, 'snsPostCounts', 'done')
+
+      cursor += batchSessionIds.length
+      if (cursor < targetSessionIds.length) {
+        snsUserPostCountsBatchTimerRef.current = window.setTimeout(applyBatch, SNS_USER_POST_COUNT_BATCH_INTERVAL_MS)
+      } else {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+      }
+    }
+
+    applyBatch()
+  }, [ensureExportCacheScope, patchSessionLoadTraceStage, snsUserPostCountsStatus])
+
+  const loadSessionSnsTimelinePosts = useCallback(async (target: SessionSnsTimelineTarget, options?: { reset?: boolean }) => {
+    const reset = Boolean(options?.reset)
+    if (sessionSnsTimelineLoadingRef.current) return
+
+    sessionSnsTimelineLoadingRef.current = true
+    if (reset) {
+      setSessionSnsTimelineLoading(true)
+      setSessionSnsTimelineLoadingMore(false)
+      setSessionSnsTimelineHasMore(false)
+    } else {
+      setSessionSnsTimelineLoadingMore(true)
+    }
+
+    const requestToken = ++sessionSnsTimelineRequestTokenRef.current
+
+    try {
+      const limit = 20
+      let endTime: number | undefined
+      if (!reset && sessionSnsTimelinePostsRef.current.length > 0) {
+        endTime = sessionSnsTimelinePostsRef.current[sessionSnsTimelinePostsRef.current.length - 1].createTime - 1
+      }
+
+      const result = await window.electronAPI.sns.getTimeline(limit, 0, [target.username], '', undefined, endTime)
+      if (requestToken !== sessionSnsTimelineRequestTokenRef.current) return
+
+      if (!result.success || !Array.isArray(result.timeline)) {
+        if (reset) {
+          setSessionSnsTimelinePosts([])
+          setSessionSnsTimelineHasMore(false)
+        }
+        return
+      }
+
+      const timeline = [...(result.timeline as SnsPost[])].sort((a, b) => b.createTime - a.createTime)
+      if (reset) {
+        setSessionSnsTimelinePosts(timeline)
+        setSessionSnsTimelineHasMore(timeline.length >= limit)
+        return
+      }
+
+      const existingIds = new Set(sessionSnsTimelinePostsRef.current.map((post) => post.id))
+      const uniqueOlder = timeline.filter((post) => !existingIds.has(post.id))
+      if (uniqueOlder.length > 0) {
+        const merged = [...sessionSnsTimelinePostsRef.current, ...uniqueOlder].sort((a, b) => b.createTime - a.createTime)
+        setSessionSnsTimelinePosts(merged)
+      }
+      if (timeline.length < limit) {
+        setSessionSnsTimelineHasMore(false)
+      }
+    } catch (error) {
+      console.error('加载联系人朋友圈失败:', error)
+      if (requestToken === sessionSnsTimelineRequestTokenRef.current && reset) {
+        setSessionSnsTimelinePosts([])
+        setSessionSnsTimelineHasMore(false)
+      }
+    } finally {
+      if (requestToken === sessionSnsTimelineRequestTokenRef.current) {
+        sessionSnsTimelineLoadingRef.current = false
+        setSessionSnsTimelineLoading(false)
+        setSessionSnsTimelineLoadingMore(false)
+      }
+    }
+  }, [])
+
+  const closeSessionSnsTimeline = useCallback(() => {
+    sessionSnsTimelineRequestTokenRef.current += 1
+    sessionSnsTimelineLoadingRef.current = false
+    setSessionSnsRankMode(null)
+    setSessionSnsTimelineTarget(null)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineLoading(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
+  }, [])
+
+  const openSessionSnsTimelineByTarget = useCallback((target: SessionSnsTimelineTarget) => {
+    setSessionSnsRankMode(null)
+    setSessionSnsTimelineTarget(target)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineLoading(false)
+
+    if (snsUserPostCountsStatus === 'ready') {
+      const count = Number(snsUserPostCounts[target.username] || 0)
+      setSessionSnsTimelineTotalPosts(Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0)
+      setSessionSnsTimelineStatsLoading(false)
+    } else {
+      setSessionSnsTimelineTotalPosts(null)
+      setSessionSnsTimelineStatsLoading(true)
+    }
+
+    void loadSessionSnsTimelinePosts(target, { reset: true })
+    void loadSnsUserPostCounts()
+  }, [
+    loadSessionSnsTimelinePosts,
+    loadSnsUserPostCounts,
+    snsUserPostCounts,
+    snsUserPostCountsStatus
+  ])
+
+  const openSessionSnsTimeline = useCallback(() => {
+    const normalizedSessionId = String(sessionDetail?.wxid || '').trim()
+    if (!isSingleContactSession(normalizedSessionId) || !sessionDetail) return
+
+    const target: SessionSnsTimelineTarget = {
+      username: normalizedSessionId,
+      displayName: sessionDetail.displayName || sessionDetail.remark || sessionDetail.nickName || normalizedSessionId,
+      avatarUrl: sessionDetail.avatarUrl
+    }
+
+    openSessionSnsTimelineByTarget(target)
+  }, [openSessionSnsTimelineByTarget, sessionDetail])
+
+  const openContactSnsTimeline = useCallback((contact: ContactInfo) => {
+    const normalizedSessionId = String(contact?.username || '').trim()
+    if (!isSingleContactSession(normalizedSessionId)) return
+    openSessionSnsTimelineByTarget({
+      username: normalizedSessionId,
+      displayName: contact.displayName || contact.remark || contact.nickname || normalizedSessionId,
+      avatarUrl: contact.avatarUrl
+    })
+  }, [openSessionSnsTimelineByTarget])
+
+  const loadMoreSessionSnsTimeline = useCallback(() => {
+    if (!sessionSnsTimelineTarget || sessionSnsTimelineLoading || sessionSnsTimelineLoadingMore || !sessionSnsTimelineHasMore) return
+    void loadSessionSnsTimelinePosts(sessionSnsTimelineTarget, { reset: false })
+  }, [
+    loadSessionSnsTimelinePosts,
+    sessionSnsTimelineHasMore,
+    sessionSnsTimelineLoading,
+    sessionSnsTimelineLoadingMore,
+    sessionSnsTimelineTarget
+  ])
+
+  const renderSessionSnsTimelineStats = useCallback((): string => {
+    const loadedCount = sessionSnsTimelinePosts.length
+    const loadPart = sessionSnsTimelineStatsLoading
+      ? `已加载 ${loadedCount} / 总数统计中...`
+      : sessionSnsTimelineTotalPosts === null
+        ? `已加载 ${loadedCount} 条`
+        : `已加载 ${loadedCount} / 共 ${sessionSnsTimelineTotalPosts} 条`
+
+    if (sessionSnsTimelineLoading && loadedCount === 0) return `${loadPart} ｜ 加载中...`
+    if (loadedCount === 0) return loadPart
+
+    const latest = sessionSnsTimelinePosts[0]?.createTime
+    const earliest = sessionSnsTimelinePosts[sessionSnsTimelinePosts.length - 1]?.createTime
+    const rangeText = `${formatYmdDateFromSeconds(earliest)} ~ ${formatYmdDateFromSeconds(latest)}`
+    return `${loadPart} ｜ ${rangeText}`
+  }, [
+    sessionSnsTimelineLoading,
+    sessionSnsTimelinePosts,
+    sessionSnsTimelineStatsLoading,
+    sessionSnsTimelineTotalPosts
+  ])
+
+  const sessionSnsLikeRankings = useMemo(() => {
+    const rankMap = new Map<string, { name: string; count: number; latestTime: number }>()
+    for (const post of sessionSnsTimelinePosts) {
+      const createTime = Number(post?.createTime) || 0
+      const likes = Array.isArray(post?.likes) ? post.likes : []
+      for (const likeNameRaw of likes) {
+        const name = String(likeNameRaw || '').trim() || '未知用户'
+        const current = rankMap.get(name)
+        if (current) {
+          current.count += 1
+          if (createTime > current.latestTime) current.latestTime = createTime
+          continue
+        }
+        rankMap.set(name, { name, count: 1, latestTime: createTime })
+      }
+    }
+    return [...rankMap.values()].sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count
+      if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+      return a.name.localeCompare(b.name, 'zh-CN')
+    })
+  }, [sessionSnsTimelinePosts])
+
+  const sessionSnsCommentRankings = useMemo(() => {
+    const rankMap = new Map<string, { name: string; count: number; latestTime: number }>()
+    for (const post of sessionSnsTimelinePosts) {
+      const createTime = Number(post?.createTime) || 0
+      const comments = Array.isArray(post?.comments) ? post.comments : []
+      for (const comment of comments) {
+        const name = String(comment?.nickname || '').trim() || '未知用户'
+        const current = rankMap.get(name)
+        if (current) {
+          current.count += 1
+          if (createTime > current.latestTime) current.latestTime = createTime
+          continue
+        }
+        rankMap.set(name, { name, count: 1, latestTime: createTime })
+      }
+    }
+    return [...rankMap.values()].sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count
+      if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+      return a.name.localeCompare(b.name, 'zh-CN')
+    })
+  }, [sessionSnsTimelinePosts])
+
+  const toggleSessionSnsRankMode = useCallback((mode: SnsRankMode) => {
+    setSessionSnsRankMode((prev) => (prev === mode ? null : mode))
+  }, [])
+
+  const sessionSnsActiveRankings = useMemo(() => {
+    if (sessionSnsRankMode === 'likes') return sessionSnsLikeRankings
+    if (sessionSnsRankMode === 'comments') return sessionSnsCommentRankings
+    return []
+  }, [sessionSnsCommentRankings, sessionSnsLikeRankings, sessionSnsRankMode])
+
   const mergeSessionContentMetrics = useCallback((input: Record<string, SessionExportMetric | SessionContentMetric | undefined>) => {
     const entries = Object.entries(input)
     if (entries.length === 0) return
@@ -1818,6 +2399,194 @@ function ExportPage() {
     }
   }, [])
 
+  const resetSessionMediaMetricLoader = useCallback(() => {
+    sessionMediaMetricRunIdRef.current += 1
+    sessionMediaMetricQueueRef.current = []
+    sessionMediaMetricQueuedSetRef.current.clear()
+    sessionMediaMetricLoadingSetRef.current.clear()
+    sessionMediaMetricReadySetRef.current.clear()
+    sessionMediaMetricWorkerRunningRef.current = false
+    sessionMediaMetricPendingPersistRef.current = {}
+    sessionMediaMetricVisibleRangeRef.current = { startIndex: 0, endIndex: -1 }
+    if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+      sessionMediaMetricBackgroundFeedTimerRef.current = null
+    }
+    if (sessionMediaMetricPersistTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricPersistTimerRef.current)
+      sessionMediaMetricPersistTimerRef.current = null
+    }
+  }, [])
+
+  const flushSessionMediaMetricCache = useCallback(async () => {
+    const pendingMetrics = sessionMediaMetricPendingPersistRef.current
+    sessionMediaMetricPendingPersistRef.current = {}
+    if (Object.keys(pendingMetrics).length === 0) return
+
+    try {
+      const scopeKey = await ensureExportCacheScope()
+      const existing = await configService.getExportSessionContentMetricCache(scopeKey)
+      const nextMetrics = {
+        ...(existing?.metrics || {}),
+        ...pendingMetrics
+      }
+      await configService.setExportSessionContentMetricCache(scopeKey, nextMetrics)
+    } catch (error) {
+      console.error('写入导出页会话内容统计缓存失败:', error)
+    }
+  }, [ensureExportCacheScope])
+
+  const scheduleFlushSessionMediaMetricCache = useCallback(() => {
+    if (sessionMediaMetricPersistTimerRef.current) return
+    sessionMediaMetricPersistTimerRef.current = window.setTimeout(() => {
+      sessionMediaMetricPersistTimerRef.current = null
+      void flushSessionMediaMetricCache()
+    }, SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS)
+  }, [flushSessionMediaMetricCache])
+
+  const isSessionMediaMetricReady = useCallback((sessionId: string): boolean => {
+    if (!sessionId) return true
+    if (sessionMediaMetricReadySetRef.current.has(sessionId)) return true
+    const existing = sessionContentMetricsRef.current[sessionId]
+    if (hasCompleteSessionMediaMetric(existing)) {
+      sessionMediaMetricReadySetRef.current.add(sessionId)
+      return true
+    }
+    return false
+  }, [])
+
+  const enqueueSessionMediaMetricRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    const front = options?.front === true
+    const incoming: string[] = []
+    for (const sessionIdRaw of sessionIds) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      if (sessionMediaMetricQueuedSetRef.current.has(sessionId)) continue
+      if (sessionMediaMetricLoadingSetRef.current.has(sessionId)) continue
+      if (isSessionMediaMetricReady(sessionId)) continue
+      sessionMediaMetricQueuedSetRef.current.add(sessionId)
+      incoming.push(sessionId)
+    }
+    if (incoming.length === 0) return
+    patchSessionLoadTraceStage(incoming, 'mediaMetrics', 'pending')
+    if (front) {
+      sessionMediaMetricQueueRef.current = [...incoming, ...sessionMediaMetricQueueRef.current]
+    } else {
+      sessionMediaMetricQueueRef.current.push(...incoming)
+    }
+  }, [isSessionMediaMetricReady, patchSessionLoadTraceStage])
+
+  const applySessionMediaMetricsFromStats = useCallback((data?: Record<string, SessionExportMetric>) => {
+    if (!data) return
+    const nextMetrics: Record<string, SessionContentMetric> = {}
+    let hasPatch = false
+    for (const [sessionIdRaw, metricRaw] of Object.entries(data)) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      const metric = pickSessionMediaMetric(metricRaw)
+      if (!metric) continue
+      nextMetrics[sessionId] = metric
+      hasPatch = true
+      sessionMediaMetricPendingPersistRef.current[sessionId] = {
+        ...sessionMediaMetricPendingPersistRef.current[sessionId],
+        ...metric
+      }
+      if (hasCompleteSessionMediaMetric(metric)) {
+        sessionMediaMetricReadySetRef.current.add(sessionId)
+      }
+    }
+
+    if (hasPatch) {
+      mergeSessionContentMetrics(nextMetrics)
+      scheduleFlushSessionMediaMetricCache()
+    }
+  }, [mergeSessionContentMetrics, scheduleFlushSessionMediaMetricCache])
+
+  const runSessionMediaMetricWorker = useCallback(async (runId: number) => {
+    if (sessionMediaMetricWorkerRunningRef.current) return
+    sessionMediaMetricWorkerRunningRef.current = true
+    try {
+      while (runId === sessionMediaMetricRunIdRef.current) {
+        if (isLoadingSessionCountsRef.current || detailStatsPriorityRef.current) {
+          await new Promise(resolve => window.setTimeout(resolve, 80))
+          continue
+        }
+
+        if (sessionMediaMetricQueueRef.current.length === 0) break
+
+        const batchSessionIds: string[] = []
+        while (batchSessionIds.length < SESSION_MEDIA_METRIC_BATCH_SIZE && sessionMediaMetricQueueRef.current.length > 0) {
+          const nextId = sessionMediaMetricQueueRef.current.shift()
+          if (!nextId) continue
+          sessionMediaMetricQueuedSetRef.current.delete(nextId)
+          if (sessionMediaMetricLoadingSetRef.current.has(nextId)) continue
+          if (isSessionMediaMetricReady(nextId)) continue
+          sessionMediaMetricLoadingSetRef.current.add(nextId)
+          batchSessionIds.push(nextId)
+        }
+        if (batchSessionIds.length === 0) {
+          continue
+        }
+        patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'loading')
+
+        try {
+          const cacheResult = await window.electronAPI.chat.getExportSessionStats(
+            batchSessionIds,
+            { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+          )
+          if (runId !== sessionMediaMetricRunIdRef.current) return
+          if (cacheResult.success && cacheResult.data) {
+            applySessionMediaMetricsFromStats(cacheResult.data as Record<string, SessionExportMetric>)
+          }
+
+          const missingSessionIds = batchSessionIds.filter(sessionId => !isSessionMediaMetricReady(sessionId))
+          if (missingSessionIds.length > 0) {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              missingSessionIds,
+              { includeRelations: false, allowStaleCache: true }
+            )
+            if (runId !== sessionMediaMetricRunIdRef.current) return
+            if (freshResult.success && freshResult.data) {
+              applySessionMediaMetricsFromStats(freshResult.data as Record<string, SessionExportMetric>)
+            }
+          }
+        } catch (error) {
+          console.error('导出页加载会话媒体统计失败:', error)
+          patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'failed', {
+            error: String(error)
+          })
+        } finally {
+          const completedSessionIds: string[] = []
+          for (const sessionId of batchSessionIds) {
+            sessionMediaMetricLoadingSetRef.current.delete(sessionId)
+            if (isSessionMediaMetricReady(sessionId)) {
+              sessionMediaMetricReadySetRef.current.add(sessionId)
+              completedSessionIds.push(sessionId)
+            }
+          }
+          if (completedSessionIds.length > 0) {
+            patchSessionLoadTraceStage(completedSessionIds, 'mediaMetrics', 'done')
+          }
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    } finally {
+      sessionMediaMetricWorkerRunningRef.current = false
+      if (runId === sessionMediaMetricRunIdRef.current && sessionMediaMetricQueueRef.current.length > 0) {
+        void runSessionMediaMetricWorker(runId)
+      }
+    }
+  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
+
+  const scheduleSessionMediaMetricWorker = useCallback(() => {
+    if (!isSessionCountStageReady) return
+    if (isLoadingSessionCountsRef.current) return
+    if (sessionMediaMetricWorkerRunningRef.current) return
+    const runId = sessionMediaMetricRunIdRef.current
+    void runSessionMediaMetricWorker(runId)
+  }, [isSessionCountStageReady, runSessionMediaMetricWorker])
+
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
     priorityTab: ConversationTab,
@@ -1829,8 +2598,12 @@ function ExportPage() {
     const requestId = sessionCountRequestIdRef.current + 1
     sessionCountRequestIdRef.current = requestId
     const isStale = () => sessionCountRequestIdRef.current !== requestId
+    setIsSessionCountStageReady(false)
 
     const exportableSessions = sourceSessions.filter(session => session.hasSession)
+    const exportableSessionIds = exportableSessions.map(session => session.username)
+    const exportableSessionIdSet = new Set(exportableSessionIds)
+    patchSessionLoadTraceStage(exportableSessionIds, 'messageCount', 'pending', { force: true })
     const seededHintCounts = exportableSessions.reduce<Record<string, number>>((acc, session) => {
       const nextCount = normalizeMessageCount(session.messageCountHint)
       if (typeof nextCount === 'number') {
@@ -1839,12 +2612,17 @@ function ExportPage() {
       return acc
     }, {})
     const seededPersistentCounts = Object.entries(options?.seededCounts || {}).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+      if (!exportableSessionIdSet.has(sessionId)) return acc
       const nextCount = normalizeMessageCount(countRaw)
       if (typeof nextCount === 'number') {
         acc[sessionId] = nextCount
       }
       return acc
     }, {})
+    const seededPersistentSessionIds = Object.keys(seededPersistentCounts)
+    if (seededPersistentSessionIds.length > 0) {
+      patchSessionLoadTraceStage(seededPersistentSessionIds, 'messageCount', 'done')
+    }
     const seededCounts = { ...seededHintCounts, ...seededPersistentCounts }
     const accumulatedCounts: Record<string, number> = { ...seededCounts }
     setSessionMessageCounts(seededCounts)
@@ -1859,6 +2637,9 @@ function ExportPage() {
 
     if (exportableSessions.length === 0) {
       setIsLoadingSessionCounts(false)
+      if (!isStale()) {
+        setIsSessionCountStageReady(true)
+      }
       return { ...accumulatedCounts }
     }
 
@@ -1894,26 +2675,54 @@ function ExportPage() {
 
     setIsLoadingSessionCounts(true)
     try {
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (prioritizedSessionIds.length > 0) {
+        patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'loading')
         const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
         if (isStale()) return { ...accumulatedCounts }
         if (priorityResult.success) {
           applyCounts(priorityResult.counts)
+          patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'done')
+        } else {
+          patchSessionLoadTraceStage(
+            prioritizedSessionIds,
+            'messageCount',
+            'failed',
+            { error: priorityResult.error || '总消息数加载失败' }
+          )
         }
       }
 
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (remainingSessionIds.length > 0) {
+        patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'loading')
         const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
         if (isStale()) return { ...accumulatedCounts }
         if (remainingResult.success) {
           applyCounts(remainingResult.counts)
+          patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'done')
+        } else {
+          patchSessionLoadTraceStage(
+            remainingSessionIds,
+            'messageCount',
+            'failed',
+            { error: remainingResult.error || '总消息数加载失败' }
+          )
         }
       }
     } catch (error) {
       console.error('导出页加载会话消息总数失败:', error)
+      patchSessionLoadTraceStage(exportableSessionIds, 'messageCount', 'failed', {
+        error: String(error)
+      })
     } finally {
       if (!isStale()) {
         setIsLoadingSessionCounts(false)
+        setIsSessionCountStageReady(true)
         if (options?.scopeKey && Object.keys(accumulatedCounts).length > 0) {
           try {
             await configService.setExportSessionMessageCountCache(options.scopeKey, accumulatedCounts)
@@ -1924,18 +2733,31 @@ function ExportPage() {
       }
     }
     return { ...accumulatedCounts }
-  }, [mergeSessionContentMetrics])
+  }, [mergeSessionContentMetrics, patchSessionLoadTraceStage])
 
   const loadSessions = useCallback(async () => {
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
     sessionsHydratedAtRef.current = 0
+    sessionPreciseRefreshAtRef.current = {}
+    resetSessionMediaMetricLoader()
     setIsLoading(true)
     setIsSessionEnriching(false)
     sessionCountRequestIdRef.current += 1
     setSessionMessageCounts({})
     setSessionContentMetrics({})
+    setSessionLoadTraceMap({})
+    setSessionLoadProgressPulseMap({})
+    sessionLoadProgressSnapshotRef.current = {}
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+    setSnsUserPostCounts({})
+    setSnsUserPostCountsStatus('idle')
     setIsLoadingSessionCounts(false)
+    setIsSessionCountStageReady(false)
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -1945,10 +2767,12 @@ function ExportPage() {
 
       const [
         cachedContactsPayload,
-        cachedMessageCountsPayload
+        cachedMessageCountsPayload,
+        cachedContentMetricsPayload
       ] = await Promise.all([
         loadContactsCaches(scopeKey),
-        configService.getExportSessionMessageCountCache(scopeKey)
+        configService.getExportSessionMessageCountCache(scopeKey),
+        configService.getExportSessionContentMetricCache(scopeKey)
       ])
       if (isStale()) return
 
@@ -1962,7 +2786,7 @@ function ExportPage() {
       const cachedContactMap = toContactMapFromCaches(cachedContacts, cachedAvatarEntries)
       if (cachedContacts.length > 0) {
         syncContactTypeCounts(Object.values(cachedContactMap))
-        setSessions(toSessionRowsWithContacts([], cachedContactMap))
+        setSessions(toSessionRowsWithContacts([], cachedContactMap).filter(isExportConversationSession))
         setSessionDataSource('cache')
         setIsLoading(false)
       }
@@ -1981,7 +2805,7 @@ function ExportPage() {
 
       if (sessionsResult.success && sessionsResult.sessions) {
         const rawSessions = sessionsResult.sessions
-        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap)
+        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap).filter(isExportConversationSession)
         const exportableSessionIds = baseSessions
           .filter((session) => session.hasSession)
           .map((session) => session.username)
@@ -2000,6 +2824,22 @@ function ExportPage() {
           acc[sessionId] = { totalMessages: count }
           return acc
         }, {})
+        const cachedContentMetrics = Object.entries(cachedContentMetricsPayload?.metrics || {}).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, rawMetric]) => {
+          if (!exportableSessionIdSet.has(sessionId)) return acc
+          const metric = pickSessionMediaMetric(rawMetric)
+          if (!metric) return acc
+          acc[sessionId] = metric
+          if (hasCompleteSessionMediaMetric(metric)) {
+            sessionMediaMetricReadySetRef.current.add(sessionId)
+          }
+          return acc
+        }, {})
+        const cachedContentMetricReadySessionIds = Object.entries(cachedContentMetrics)
+          .filter(([, metric]) => hasCompleteSessionMediaMetric(metric))
+          .map(([sessionId]) => sessionId)
+        if (cachedContentMetricReadySessionIds.length > 0) {
+          patchSessionLoadTraceStage(cachedContentMetricReadySessionIds, 'mediaMetrics', 'done')
+        }
 
         if (isStale()) return
         if (Object.keys(cachedMessageCounts).length > 0) {
@@ -2007,6 +2847,9 @@ function ExportPage() {
         }
         if (Object.keys(cachedCountAsMetrics).length > 0) {
           mergeSessionContentMetrics(cachedCountAsMetrics)
+        }
+        if (Object.keys(cachedContentMetrics).length > 0) {
+          mergeSessionContentMetrics(cachedContentMetrics)
         }
         setSessions(baseSessions)
         sessionsHydratedAtRef.current = Date.now()
@@ -2027,12 +2870,14 @@ function ExportPage() {
         setIsSessionEnriching(true)
         void (async () => {
           try {
+            if (detailStatsPriorityRef.current) return
             let contactMap = { ...cachedContactMap }
             let avatarEntries = { ...cachedAvatarEntries }
             let hasFreshNetworkData = false
             let hasNetworkContactsSnapshot = false
 
             if (isStale()) return
+            if (detailStatsPriorityRef.current) return
             const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
             if (isStale()) return
 
@@ -2091,6 +2936,7 @@ function ExportPage() {
             if (needsEnrichment.length > 0) {
               for (let i = 0; i < needsEnrichment.length; i += EXPORT_AVATAR_ENRICH_BATCH_SIZE) {
                 if (isStale()) return
+                if (detailStatsPriorityRef.current) return
                 const batch = needsEnrichment.slice(i, i + EXPORT_AVATAR_ENRICH_BATCH_SIZE)
                 if (batch.length === 0) continue
                 try {
@@ -2152,7 +2998,7 @@ function ExportPage() {
             }, contactMap)
 
             if (isStale()) return
-            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap)
+            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap).filter(isExportConversationSession)
               .map((session) => {
                 const extra = extraContactMap[session.username]
                 const displayName = extra?.displayName || session.displayName || session.username
@@ -2205,7 +3051,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, resetSessionMediaMetricLoader, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -2237,9 +3083,21 @@ function ExportPage() {
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
     sessionCountRequestIdRef.current += 1
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
+    setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
   }, [isExportRoute])
+
+  useEffect(() => {
+    if (activeTab === 'official') {
+      setActiveTab('private')
+    }
+  }, [activeTab])
 
   useEffect(() => {
     activeTabRef.current = activeTab
@@ -3280,9 +4138,11 @@ function ExportPage() {
   const activeTabLabel = useMemo(() => {
     if (activeTab === 'private') return '私聊'
     if (activeTab === 'group') return '群聊'
-    if (activeTab === 'former_friend') return '曾经的好友'
-    return '公众号'
+    return '曾经的好友'
   }, [activeTab])
+  const shouldShowSnsColumn = useMemo(() => (
+    activeTab === 'private' || activeTab === 'former_friend'
+  ), [activeTab])
 
   const sessionRowByUsername = useMemo(() => {
     const map = new Map<string, SessionRow>()
@@ -3336,10 +4196,296 @@ function ExportPage() {
     return indexedContacts.map(item => item.contact)
   }, [contactsList, activeTab, searchKeyword, sessionMessageCounts, sessionRowByUsername])
 
+  const keywordMatchedContactUsernameSet = useMemo(() => {
+    const keyword = searchKeyword.trim().toLowerCase()
+    const matched = new Set<string>()
+    for (const contact of contactsList) {
+      if (!contact?.username) continue
+      if (!keyword) {
+        matched.add(contact.username)
+        continue
+      }
+      if (
+        (contact.displayName || '').toLowerCase().includes(keyword) ||
+        (contact.remark || '').toLowerCase().includes(keyword) ||
+        (contact.nickname || '').toLowerCase().includes(keyword) ||
+        (contact.alias || '').toLowerCase().includes(keyword) ||
+        contact.username.toLowerCase().includes(keyword)
+      ) {
+        matched.add(contact.username)
+      }
+    }
+    return matched
+  }, [contactsList, searchKeyword])
+
+  const loadDetailTargetsByTab = useMemo(() => {
+    const targets: Record<ConversationTab, string[]> = {
+      private: [],
+      group: [],
+      official: [],
+      former_friend: []
+    }
+    for (const session of sessions) {
+      if (!session.hasSession) continue
+      if (!keywordMatchedContactUsernameSet.has(session.username)) continue
+      targets[session.kind].push(session.username)
+    }
+    return targets
+  }, [keywordMatchedContactUsernameSet, sessions])
+
+  const formatLoadDetailTime = useCallback((value?: number): string => {
+    if (!value || !Number.isFinite(value)) return '--'
+    return new Date(value).toLocaleTimeString('zh-CN', { hour12: false })
+  }, [])
+
+  const getLoadDetailStatusLabel = useCallback((loaded: number, total: number, hasStarted: boolean): string => {
+    if (total <= 0) return '待加载'
+    if (loaded >= total) return `已完成 ${total}`
+    if (hasStarted) return `加载中 ${loaded}/${total}`
+    return '待加载'
+  }, [])
+
+  const summarizeLoadTraceForTab = useCallback((
+    sessionIds: string[],
+    stageKey: keyof SessionLoadTraceState
+  ): SessionLoadStageSummary => {
+    const total = sessionIds.length
+    let loaded = 0
+    let hasStarted = false
+    let earliestStart: number | undefined
+    let latestFinish: number | undefined
+    let latestProgressAt: number | undefined
+    for (const sessionId of sessionIds) {
+      const stage = sessionLoadTraceMap[sessionId]?.[stageKey]
+      if (stage?.status === 'done') {
+        loaded += 1
+        if (typeof stage.finishedAt === 'number') {
+          latestProgressAt = latestProgressAt === undefined
+            ? stage.finishedAt
+            : Math.max(latestProgressAt, stage.finishedAt)
+        }
+      }
+      if (stage?.status === 'loading' || stage?.status === 'failed' || typeof stage?.startedAt === 'number') {
+        hasStarted = true
+      }
+      if (typeof stage?.startedAt === 'number') {
+        earliestStart = earliestStart === undefined
+          ? stage.startedAt
+          : Math.min(earliestStart, stage.startedAt)
+      }
+      if (typeof stage?.finishedAt === 'number') {
+        latestFinish = latestFinish === undefined
+          ? stage.finishedAt
+          : Math.max(latestFinish, stage.finishedAt)
+      }
+    }
+    return {
+      total,
+      loaded,
+      statusLabel: getLoadDetailStatusLabel(loaded, total, hasStarted),
+      startedAt: earliestStart,
+      finishedAt: loaded >= total ? latestFinish : undefined,
+      latestProgressAt
+    }
+  }, [getLoadDetailStatusLabel, sessionLoadTraceMap])
+
+  const createNotApplicableLoadSummary = useCallback((): SessionLoadStageSummary => {
+    return {
+      total: 0,
+      loaded: 0,
+      statusLabel: '不适用'
+    }
+  }, [])
+
+  const sessionLoadDetailRows = useMemo(() => {
+    const tabOrder: ConversationTab[] = ['private', 'group', 'former_friend']
+    return tabOrder.map((tab) => {
+      const sessionIds = loadDetailTargetsByTab[tab] || []
+      const snsSessionIds = sessionIds.filter((sessionId) => isSingleContactSession(sessionId))
+      const snsPostCounts = tab === 'private'
+        ? summarizeLoadTraceForTab(snsSessionIds, 'snsPostCounts')
+        : createNotApplicableLoadSummary()
+      return {
+        tab,
+        label: conversationTabLabels[tab],
+        messageCount: summarizeLoadTraceForTab(sessionIds, 'messageCount'),
+        mediaMetrics: summarizeLoadTraceForTab(sessionIds, 'mediaMetrics'),
+        snsPostCounts
+      }
+    })
+  }, [createNotApplicableLoadSummary, loadDetailTargetsByTab, summarizeLoadTraceForTab])
+
+  const formatLoadDetailPulseTime = useCallback((value?: number): string => {
+    if (!value || !Number.isFinite(value)) return '--'
+    return new Date(value).toLocaleTimeString('zh-CN', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    })
+  }, [])
+
+  useEffect(() => {
+    const previousSnapshot = sessionLoadProgressSnapshotRef.current
+    const nextSnapshot: Record<string, { loaded: number; total: number }> = {}
+    const resetKeys: string[] = []
+    const updates: Array<{ key: string; at: number; delta: number }> = []
+    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics', 'snsPostCounts']
+
+    for (const row of sessionLoadDetailRows) {
+      for (const stageKey of stageKeys) {
+        const summary = row[stageKey]
+        const key = `${stageKey}:${row.tab}`
+        const loaded = Number.isFinite(summary.loaded) ? Math.max(0, Math.floor(summary.loaded)) : 0
+        const total = Number.isFinite(summary.total) ? Math.max(0, Math.floor(summary.total)) : 0
+        nextSnapshot[key] = { loaded, total }
+
+        const previous = previousSnapshot[key]
+        if (!previous || previous.total !== total || loaded < previous.loaded) {
+          resetKeys.push(key)
+          continue
+        }
+        if (loaded > previous.loaded) {
+          updates.push({
+            key,
+            at: summary.latestProgressAt || Date.now(),
+            delta: loaded - previous.loaded
+          })
+        }
+      }
+    }
+
+    sessionLoadProgressSnapshotRef.current = nextSnapshot
+    if (resetKeys.length === 0 && updates.length === 0) return
+
+    setSessionLoadProgressPulseMap(prev => {
+      let changed = false
+      const next = { ...prev }
+      for (const key of resetKeys) {
+        if (!(key in next)) continue
+        delete next[key]
+        changed = true
+      }
+      for (const update of updates) {
+        const previous = next[update.key]
+        if (previous && previous.at === update.at && previous.delta === update.delta) continue
+        next[update.key] = { at: update.at, delta: update.delta }
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [sessionLoadDetailRows])
+
   useEffect(() => {
     contactsVirtuosoRef.current?.scrollToIndex({ index: 0, align: 'start' })
     setIsContactsListAtTop(true)
   }, [activeTab, searchKeyword])
+
+  const collectVisibleSessionMetricTargets = useCallback((sourceContacts: ContactInfo[]): string[] => {
+    if (sourceContacts.length === 0) return []
+    const startCandidate = sessionMediaMetricVisibleRangeRef.current.startIndex
+    const endCandidate = sessionMediaMetricVisibleRangeRef.current.endIndex
+    const startIndex = Math.max(0, Math.min(sourceContacts.length - 1, startCandidate >= 0 ? startCandidate : 0))
+    const visibleEnd = endCandidate >= startIndex
+      ? endCandidate
+      : Math.min(sourceContacts.length - 1, startIndex + 9)
+    const endIndex = Math.max(startIndex, Math.min(sourceContacts.length - 1, visibleEnd + SESSION_MEDIA_METRIC_PREFETCH_ROWS))
+    const sessionIds: string[] = []
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const contact = sourceContacts[index]
+      if (!contact?.username) continue
+      const mappedSession = sessionRowByUsername.get(contact.username)
+      if (!mappedSession?.hasSession) continue
+      sessionIds.push(contact.username)
+    }
+    return sessionIds
+  }, [sessionRowByUsername])
+
+  const handleContactsRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
+    const startIndex = Number.isFinite(range?.startIndex) ? Math.max(0, Math.floor(range.startIndex)) : 0
+    const endIndex = Number.isFinite(range?.endIndex) ? Math.max(startIndex, Math.floor(range.endIndex)) : startIndex
+    sessionMediaMetricVisibleRangeRef.current = { startIndex, endIndex }
+    if (isLoadingSessionCountsRef.current || !isSessionCountStageReady) return
+    const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
+    if (visibleTargets.length === 0) return
+    enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
+    scheduleSessionMediaMetricWorker()
+  }, [collectVisibleSessionMetricTargets, enqueueSessionMediaMetricRequests, filteredContacts, isSessionCountStageReady, scheduleSessionMediaMetricWorker])
+
+  useEffect(() => {
+    if (!isSessionCountStageReady || filteredContacts.length === 0) return
+    const runId = sessionMediaMetricRunIdRef.current
+    const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
+    if (visibleTargets.length > 0) {
+      enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
+      scheduleSessionMediaMetricWorker()
+    }
+
+    if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+      sessionMediaMetricBackgroundFeedTimerRef.current = null
+    }
+
+    const visibleTargetSet = new Set(visibleTargets)
+    let cursor = 0
+    const feedNext = () => {
+      if (runId !== sessionMediaMetricRunIdRef.current) return
+      if (isLoadingSessionCountsRef.current) return
+      const batchIds: string[] = []
+      while (cursor < filteredContacts.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
+        const contact = filteredContacts[cursor]
+        cursor += 1
+        if (!contact?.username) continue
+        if (visibleTargetSet.has(contact.username)) continue
+        const mappedSession = sessionRowByUsername.get(contact.username)
+        if (!mappedSession?.hasSession) continue
+        batchIds.push(contact.username)
+      }
+
+      if (batchIds.length > 0) {
+        enqueueSessionMediaMetricRequests(batchIds)
+        scheduleSessionMediaMetricWorker()
+      }
+
+      if (cursor < filteredContacts.length) {
+        sessionMediaMetricBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
+      }
+    }
+
+    feedNext()
+    return () => {
+      if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+        sessionMediaMetricBackgroundFeedTimerRef.current = null
+      }
+    }
+  }, [
+    collectVisibleSessionMetricTargets,
+    enqueueSessionMediaMetricRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMediaMetricWorker,
+    sessionRowByUsername
+  ])
+
+  useEffect(() => {
+    return () => {
+      snsUserPostCountsHydrationTokenRef.current += 1
+      if (snsUserPostCountsBatchTimerRef.current) {
+        window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+        snsUserPostCountsBatchTimerRef.current = null
+      }
+      if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+        sessionMediaMetricBackgroundFeedTimerRef.current = null
+      }
+      if (sessionMediaMetricPersistTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricPersistTimerRef.current)
+        sessionMediaMetricPersistTimerRef.current = null
+      }
+      void flushSessionMediaMetricCache()
+    }
+  }, [flushSessionMediaMetricCache])
 
   const contactByUsername = useMemo(() => {
     const map = new Map<string, ContactInfo>()
@@ -3357,6 +4503,27 @@ function ExportPage() {
       .sort((a, b) => Number(b.exportTime || 0) - Number(a.exportTime || 0))
       .slice(0, 20)
   }, [sessionDetail?.wxid, exportRecordsBySession])
+
+  const sessionDetailSupportsSnsTimeline = useMemo(() => {
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    return isSingleContactSession(sessionId)
+  }, [sessionDetail?.wxid])
+
+  const sessionDetailSnsCountLabel = useMemo(() => {
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    if (!sessionId || !sessionDetailSupportsSnsTimeline) return '朋友圈：0条'
+
+    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+      return '朋友圈：统计中...'
+    }
+    if (snsUserPostCountsStatus === 'error') {
+      return '朋友圈：统计失败'
+    }
+
+    const count = Number(snsUserPostCounts[sessionId] || 0)
+    const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+    return `朋友圈：${normalized}条`
+  }, [sessionDetail?.wxid, sessionDetailSupportsSnsTimeline, snsUserPostCounts, snsUserPostCountsStatus])
 
   const applySessionDetailStats = useCallback((
     sessionId: string,
@@ -3399,6 +4566,11 @@ function ExportPage() {
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
     if (!normalizedSessionId) return
+    const preciseCacheKey = `${exportCacheScopeRef.current}::${normalizedSessionId}`
+
+    detailStatsPriorityRef.current = true
+    sessionCountRequestIdRef.current += 1
+    setIsLoadingSessionCounts(false)
 
     const requestSeq = ++detailRequestSeqRef.current
     const mappedSession = sessionRowByUsername.get(normalizedSessionId)
@@ -3510,19 +4682,13 @@ function ExportPage() {
     }
 
     try {
-      const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
-        window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
-        window.electronAPI.chat.getExportSessionStats(
-          [normalizedSessionId],
-          { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
-        )
-      ])
-
-      if (requestSeq !== detailRequestSeqRef.current) return
-
-      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
-        const detail = extraResultSettled.value.detail
-        if (detail) {
+      const extraPromise = window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId)
+      void (async () => {
+        try {
+          const extraResult = await extraPromise
+          if (requestSeq !== detailRequestSeqRef.current) return
+          if (!extraResult.success || !extraResult.detail) return
+          const detail = extraResult.detail
           setSessionDetail((prev) => {
             if (!prev || prev.wxid !== normalizedSessionId) return prev
             return {
@@ -3532,51 +4698,73 @@ function ExportPage() {
               messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
             }
           })
+        } catch (error) {
+          console.error('导出页加载会话详情补充信息失败:', error)
+        } finally {
+          if (requestSeq === detailRequestSeqRef.current) {
+            setIsLoadingSessionDetailExtra(false)
+          }
         }
+      })()
+
+      let quickMetric: SessionExportMetric | undefined
+      let quickCacheMeta: SessionExportCacheMeta | undefined
+      try {
+        const quickStatsResult = await window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+        )
+        if (requestSeq !== detailRequestSeqRef.current) return
+        if (quickStatsResult.success) {
+          quickMetric = quickStatsResult.data?.[normalizedSessionId] as SessionExportMetric | undefined
+          quickCacheMeta = quickStatsResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+          if (quickMetric) {
+            applySessionDetailStats(normalizedSessionId, quickMetric, quickCacheMeta, false)
+          } else if (quickCacheMeta) {
+            const cacheMeta = quickCacheMeta
+            setSessionDetail((prev) => {
+              if (!prev || prev.wxid !== normalizedSessionId) return prev
+              return {
+                ...prev,
+                statsUpdatedAt: cacheMeta.updatedAt,
+                statsStale: cacheMeta.stale
+              }
+            })
+          }
+        }
+      } catch (error) {
+        console.error('导出页读取会话统计缓存失败:', error)
       }
 
-      let refreshIncludeRelations = false
-      let shouldRefreshStats = false
-      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
-        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
-        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-        refreshIncludeRelations = Boolean(cacheMeta?.includeRelations)
-        if (metric) {
-          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, refreshIncludeRelations)
-        } else if (cacheMeta) {
-          setSessionDetail((prev) => {
-            if (!prev || prev.wxid !== normalizedSessionId) return prev
-            return {
-              ...prev,
-              relationStatsLoaded: refreshIncludeRelations || prev.relationStatsLoaded,
-              statsUpdatedAt: cacheMeta.updatedAt,
-              statsStale: cacheMeta.stale
-            }
-          })
-        }
-        shouldRefreshStats = Array.isArray(statsResultSettled.value.needsRefresh) &&
-          statsResultSettled.value.needsRefresh.includes(normalizedSessionId)
-      }
+      const lastPreciseAt = sessionPreciseRefreshAtRef.current[preciseCacheKey] || 0
+      const hasRecentPrecise = Date.now() - lastPreciseAt <= DETAIL_PRECISE_REFRESH_COOLDOWN_MS
+      const shouldRunPreciseRefresh = !hasRecentPrecise && (!quickMetric || Boolean(quickCacheMeta?.stale))
 
-      if (shouldRefreshStats) {
+      if (shouldRunPreciseRefresh) {
         setIsRefreshingSessionDetailStats(true)
         void (async () => {
           try {
+            // 后台精确补算三类重字段（转账/红包/通话），不阻塞首屏基础统计显示。
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
-              { includeRelations: refreshIncludeRelations, forceRefresh: true, preferAccurateSpecialTypes: true }
+              { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
             )
             if (requestSeq !== detailRequestSeqRef.current) return
             if (freshResult.success && freshResult.data) {
               const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
               const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
               if (metric) {
-                applySessionDetailStats(
-                  normalizedSessionId,
-                  metric,
-                  cacheMeta,
-                  refreshIncludeRelations ? true : undefined
-                )
+                applySessionDetailStats(normalizedSessionId, metric, cacheMeta, false)
+                sessionPreciseRefreshAtRef.current[preciseCacheKey] = Date.now()
+              } else if (cacheMeta) {
+                setSessionDetail((prev) => {
+                  if (!prev || prev.wxid !== normalizedSessionId) return prev
+                  return {
+                    ...prev,
+                    statsUpdatedAt: cacheMeta.updatedAt,
+                    statsStale: cacheMeta.stale
+                  }
+                })
               }
             }
           } catch (error) {
@@ -3590,7 +4778,6 @@ function ExportPage() {
       }
     } catch (error) {
       console.error('导出页加载会话详情补充统计失败:', error)
-    } finally {
       if (requestSeq === detailRequestSeqRef.current) {
         setIsLoadingSessionDetailExtra(false)
       }
@@ -3619,36 +4806,6 @@ function ExportPage() {
       if (metric) {
         applySessionDetailStats(normalizedSessionId, metric, cacheMeta, true)
       }
-
-      const needRefresh = relationResult.success &&
-        Array.isArray(relationResult.needsRefresh) &&
-        relationResult.needsRefresh.includes(normalizedSessionId)
-
-      if (needRefresh) {
-        setIsRefreshingSessionDetailStats(true)
-        void (async () => {
-          try {
-            const freshResult = await window.electronAPI.chat.getExportSessionStats(
-              [normalizedSessionId],
-              { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
-            )
-            if (requestSeq !== detailRequestSeqRef.current) return
-            if (freshResult.success && freshResult.data) {
-              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
-              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-              if (freshMetric) {
-                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
-              }
-            }
-          } catch (error) {
-            console.error('导出页刷新会话关系统计失败:', error)
-          } finally {
-            if (requestSeq === detailRequestSeqRef.current) {
-              setIsRefreshingSessionDetailStats(false)
-            }
-          }
-        })()
-      }
     } catch (error) {
       console.error('导出页加载会话关系统计失败:', error)
     } finally {
@@ -3658,20 +4815,78 @@ function ExportPage() {
     }
   }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
 
+  useEffect(() => {
+    if (!showSessionDetailPanel || !sessionDetailSupportsSnsTimeline) return
+    if (snsUserPostCountsStatus === 'idle') {
+      void loadSnsUserPostCounts()
+    }
+  }, [
+    loadSnsUserPostCounts,
+    sessionDetailSupportsSnsTimeline,
+    showSessionDetailPanel,
+    snsUserPostCountsStatus
+  ])
+
+  useEffect(() => {
+    if (!isExportRoute || !isSessionCountStageReady) return
+    if (snsUserPostCountsStatus !== 'idle') return
+    const timer = window.setTimeout(() => {
+      void loadSnsUserPostCounts()
+    }, 260)
+    return () => window.clearTimeout(timer)
+  }, [isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (!sessionSnsTimelineTarget) return
+    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+      setSessionSnsTimelineStatsLoading(true)
+      return
+    }
+    if (snsUserPostCountsStatus === 'ready') {
+      const total = Number(snsUserPostCounts[sessionSnsTimelineTarget.username] || 0)
+      setSessionSnsTimelineTotalPosts(Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0)
+      setSessionSnsTimelineStatsLoading(false)
+      return
+    }
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
+  }, [sessionSnsTimelineTarget, snsUserPostCounts, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (sessionSnsTimelineTotalPosts === null) return
+    if (sessionSnsTimelinePosts.length >= sessionSnsTimelineTotalPosts) {
+      setSessionSnsTimelineHasMore(false)
+    }
+  }, [sessionSnsTimelinePosts.length, sessionSnsTimelineTotalPosts])
+
   const closeSessionDetailPanel = useCallback(() => {
     detailRequestSeqRef.current += 1
+    detailStatsPriorityRef.current = false
+    sessionSnsTimelineRequestTokenRef.current += 1
+    sessionSnsTimelineLoadingRef.current = false
     setShowSessionDetailPanel(false)
     setIsLoadingSessionDetail(false)
     setIsLoadingSessionDetailExtra(false)
     setIsRefreshingSessionDetailStats(false)
     setIsLoadingSessionRelationStats(false)
+    setSessionSnsTimelineTarget(null)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineLoading(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
   }, [])
 
   const openSessionDetail = useCallback((sessionId: string) => {
     if (!sessionId) return
+    detailStatsPriorityRef.current = true
     setShowSessionDetailPanel(true)
+    if (isSingleContactSession(sessionId)) {
+      void loadSnsUserPostCounts()
+    }
     void loadSessionDetail(sessionId)
-  }, [loadSessionDetail])
+  }, [loadSessionDetail, loadSnsUserPostCounts])
 
   useEffect(() => {
     if (!showSessionDetailPanel) return
@@ -3683,6 +4898,31 @@ function ExportPage() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [closeSessionDetailPanel, showSessionDetailPanel])
+
+  useEffect(() => {
+    if (!showSessionLoadDetailModal) return
+    if (snsUserPostCountsStatus === 'idle') {
+      void loadSnsUserPostCounts()
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowSessionLoadDetailModal(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [loadSnsUserPostCounts, showSessionLoadDetailModal, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (!sessionSnsTimelineTarget) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSessionSnsTimeline()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [closeSessionSnsTimeline, sessionSnsTimelineTarget])
 
   const handleCopyDetailField = useCallback(async (text: string, field: string) => {
     try {
@@ -3798,6 +5038,22 @@ function ExportPage() {
   const taskRunningCount = tasks.filter(task => task.status === 'running').length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
   const hasFilteredContacts = filteredContacts.length > 0
+  const sessionLoadDetailUpdatedAt = useMemo(() => {
+    let latest = 0
+    for (const row of sessionLoadDetailRows) {
+      const candidateTimes = [
+        row.messageCount.finishedAt || row.messageCount.startedAt || 0,
+        row.mediaMetrics.finishedAt || row.mediaMetrics.startedAt || 0,
+        row.snsPostCounts.finishedAt || row.snsPostCounts.startedAt || 0
+      ]
+      for (const candidate of candidateTimes) {
+        if (candidate > latest) {
+          latest = candidate
+        }
+      }
+    }
+    return latest
+  }, [sessionLoadDetailRows])
   const closeTaskCenter = useCallback(() => {
     setIsTaskCenterOpen(false)
     setExpandedPerfTaskId(null)
@@ -3811,15 +5067,50 @@ function ExportPage() {
     const checked = canExport && selectedSessions.has(contact.username)
     const isRunning = canExport && runningSessionIds.has(contact.username)
     const isQueued = canExport && queuedSessionIds.has(contact.username)
-    const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
+    const recentExportTimestamp = lastExportBySession[contact.username]
+    const hasRecentExport = canExport && Boolean(recentExportTimestamp)
+    const recentExportTime = hasRecentExport ? formatRecentExportTime(recentExportTimestamp, nowTick) : ''
     const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
     const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
     const displayedMessageCount = countedMessages ?? hintedMessages
+    const mediaMetric = sessionContentMetrics[contact.username]
     const messageCountLabel = !canExport
       ? '--'
       : typeof displayedMessageCount === 'number'
         ? displayedMessageCount.toLocaleString('zh-CN')
         : '获取中'
+    const metricToDisplay = (value: unknown): { state: 'value'; text: string } | { state: 'loading' } | { state: 'na'; text: '--' } => {
+      const normalized = normalizeMessageCount(value)
+      if (!canExport) return { state: 'na', text: '--' }
+      if (typeof normalized === 'number') {
+        return { state: 'value', text: normalized.toLocaleString('zh-CN') }
+      }
+      return { state: 'loading' }
+    }
+    const emojiMetric = metricToDisplay(mediaMetric?.emojiMessages)
+    const voiceMetric = metricToDisplay(mediaMetric?.voiceMessages)
+    const imageMetric = metricToDisplay(mediaMetric?.imageMessages)
+    const videoMetric = metricToDisplay(mediaMetric?.videoMessages)
+    const supportsSnsTimeline = isSingleContactSession(contact.username)
+    const hasSnsCount = Object.prototype.hasOwnProperty.call(snsUserPostCounts, contact.username)
+    const snsStageStatus = sessionLoadTraceMap[contact.username]?.snsPostCounts?.status
+    const isSnsCountLoading = (
+      supportsSnsTimeline &&
+      !hasSnsCount &&
+      (
+        snsStageStatus === 'pending' ||
+        snsStageStatus === 'loading' ||
+        snsUserPostCountsStatus === 'loading' ||
+        snsUserPostCountsStatus === 'idle'
+      )
+    )
+    const snsRawCount = Number(snsUserPostCounts[contact.username] || 0)
+    const snsCount = Number.isFinite(snsRawCount) ? Math.max(0, Math.floor(snsRawCount)) : 0
+    const openChatLabel = contact.type === 'friend'
+      ? '打开私聊'
+      : contact.type === 'group'
+        ? '打开群聊'
+        : '打开对话'
     return (
       <div className={`contact-row ${checked ? 'selected' : ''}`}>
         <div className="contact-item">
@@ -3851,47 +5142,98 @@ function ExportPage() {
                 {messageCountLabel}
               </strong>
             </div>
-          </div>
-          <div className="row-action-cell">
-            <div className="row-action-main">
+            {canExport && (
               <button
-                className="row-open-chat-btn"
-                disabled={!canExport}
-                title={canExport ? '在新窗口打开该会话' : '该联系人暂无会话记录'}
+                type="button"
+                className="row-open-chat-link"
+                title="在新窗口打开该会话"
                 onClick={() => {
-                  if (!canExport) return
-                  void window.electronAPI.window.openSessionChatWindow(contact.username)
+                  void window.electronAPI.window.openSessionChatWindow(contact.username, {
+                    source: 'export',
+                    initialDisplayName: contact.displayName || contact.username,
+                    initialAvatarUrl: contact.avatarUrl,
+                    initialContactType: contact.type
+                  })
                 }}
               >
-                <ExternalLink size={13} />
-                打开对话
+                {openChatLabel}
               </button>
+            )}
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {emojiMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : emojiMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {voiceMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : voiceMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {imageMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : imageMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {videoMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : videoMetric.text}
+            </strong>
+          </div>
+          {shouldShowSnsColumn && (
+            <div className="row-media-metric">
+              {supportsSnsTimeline ? (
+                <button
+                  type="button"
+                  className={`row-sns-metric-btn ${isSnsCountLoading ? 'loading' : ''}`}
+                  title={`查看 ${contact.displayName || contact.username} 的朋友圈`}
+                  onClick={() => openContactSnsTimeline(contact)}
+                >
+                  {isSnsCountLoading
+                    ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="朋友圈统计加载中" />
+                    : hasSnsCount
+                      ? `${snsCount.toLocaleString('zh-CN')} 条`
+                      : '--'}
+                </button>
+              ) : (
+                <strong className="row-media-metric-value">--</strong>
+              )}
+            </div>
+          )}
+          <div className="row-action-cell">
+            <div className="row-action-main">
               <button
                 className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
                 onClick={() => openSessionDetail(contact.username)}
               >
                 详情
               </button>
-              <button
-                className={`row-export-btn ${isRunning ? 'running' : ''} ${!canExport ? 'no-session' : ''}`}
-                disabled={!canExport || isRunning}
-                onClick={() => {
-                  if (!matchedSession || !matchedSession.hasSession) return
-                  openSingleExport({
-                    ...matchedSession,
-                    displayName: contact.displayName || matchedSession.displayName || matchedSession.username
-                  })
-                }}
-              >
-                {isRunning ? (
-                  <>
-                    <Loader2 size={14} className="spin" />
-                    导出中
-                  </>
-                ) : !canExport ? '暂无会话' : isQueued ? '排队中' : '单会话导出'}
-              </button>
+              <div className="row-export-action-stack">
+                <button
+                  type="button"
+                  className={`row-export-link ${isRunning ? 'state-running' : ''} ${!canExport ? 'state-disabled' : ''}`}
+                  disabled={!canExport || isRunning}
+                  onClick={() => {
+                    if (!matchedSession || !matchedSession.hasSession) return
+                    openSingleExport({
+                      ...matchedSession,
+                      displayName: contact.displayName || matchedSession.displayName || matchedSession.username
+                    })
+                  }}
+                >
+                  {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '单会话导出'}
+                </button>
+                {hasRecentExport && <span className="row-export-time">{recentExportTime}</span>}
+              </div>
             </div>
-            {recent && <span className="row-export-time">{recent}</span>}
           </div>
         </div>
       </div>
@@ -3899,15 +5241,21 @@ function ExportPage() {
   }, [
     lastExportBySession,
     nowTick,
+    openContactSnsTimeline,
     openSessionDetail,
     openSingleExport,
     queuedSessionIds,
     runningSessionIds,
     selectedSessions,
     sessionDetail?.wxid,
+    sessionContentMetrics,
+    sessionLoadTraceMap,
     sessionMessageCounts,
     sessionRowByUsername,
     showSessionDetailPanel,
+    shouldShowSnsColumn,
+    snsUserPostCounts,
+    snsUserPostCountsStatus,
     toggleSelectSession
   ])
   const handleContactsListWheelCapture = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -4094,6 +5442,14 @@ function ExportPage() {
             '你可以先在列表中筛选目标会话，再批量导出，结果会保留每个会话的结构与时间线。'
           ]}
         />
+        <button
+          className="session-load-detail-entry"
+          type="button"
+          onClick={() => setShowSessionLoadDetailModal(true)}
+        >
+          <ClipboardList size={14} />
+          <span>数据加载详情</span>
+        </button>
       </div>
       <div className="session-table-section" ref={sessionTableSectionRef}>
         <div className="session-table-layout">
@@ -4106,9 +5462,6 @@ function ExportPage() {
                   </button>
                   <button className={`tab-btn ${activeTab === 'group' ? 'active' : ''}`} onClick={() => setActiveTab('group')}>
                     群聊 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.group}
-                  </button>
-                  <button className={`tab-btn ${activeTab === 'official' ? 'active' : ''}`} onClick={() => setActiveTab('official')}>
-                    公众号 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.official}
                   </button>
                   <button className={`tab-btn ${activeTab === 'former_friend' ? 'active' : ''}`} onClick={() => setActiveTab('former_friend')}>
                     曾经的好友 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.former_friend}
@@ -4160,6 +5513,13 @@ function ExportPage() {
                     <span className="contacts-list-header-main-label">联系人（头像/名称/微信号）</span>
                   </span>
                   <span className="contacts-list-header-count">总消息数</span>
+                  <span className="contacts-list-header-media">表情包</span>
+                  <span className="contacts-list-header-media">语音</span>
+                  <span className="contacts-list-header-media">图片</span>
+                  <span className="contacts-list-header-media">视频</span>
+                  {shouldShowSnsColumn && (
+                    <span className="contacts-list-header-media">朋友圈</span>
+                  )}
                   <span className="contacts-list-header-actions">
                     {selectedCount > 0 && (
                       <>
@@ -4237,12 +5597,154 @@ function ExportPage() {
                   data={filteredContacts}
                   computeItemKey={(_, contact) => contact.username}
                   itemContent={renderContactRow}
+                  rangeChanged={handleContactsRangeChanged}
                   atTopStateChange={setIsContactsListAtTop}
                   overscan={420}
                 />
               </div>
             )}
           </div>
+
+          {showSessionLoadDetailModal && (
+            <div
+              className="session-load-detail-overlay"
+              onClick={() => setShowSessionLoadDetailModal(false)}
+            >
+              <div
+                className="session-load-detail-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label="数据加载详情"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="session-load-detail-header">
+                  <div>
+                    <h4>数据加载详情</h4>
+                    <p>
+                      更新时间：
+                      {sessionLoadDetailUpdatedAt > 0
+                        ? new Date(sessionLoadDetailUpdatedAt).toLocaleString('zh-CN')
+                        : '暂无'}
+                    </p>
+                  </div>
+                  <button
+                    className="session-load-detail-close"
+                    type="button"
+                    onClick={() => setShowSessionLoadDetailModal(false)}
+                    aria-label="关闭"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="session-load-detail-body">
+                  <section className="session-load-detail-block">
+                    <h5>总消息数</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows.map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`messageCount:${row.tab}`]
+                        const isLoading = row.messageCount.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`message-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.messageCount.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.messageCount.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.messageCount.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>多媒体统计（表情包/图片/视频/语音）</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows.map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`mediaMetrics:${row.tab}`]
+                        const isLoading = row.mediaMetrics.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`media-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.mediaMetrics.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.mediaMetrics.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.mediaMetrics.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>朋友圈条数统计</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows
+                        .filter((row) => row.tab === 'private')
+                        .map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`snsPostCounts:${row.tab}`]
+                        const isLoading = row.snsPostCounts.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`sns-count-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.snsPostCounts.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          )}
 
           {showSessionDetailPanel && (
             <div
@@ -4315,6 +5817,21 @@ function ExportPage() {
                         <button className="copy-btn" title="复制" onClick={() => void handleCopyDetailField(sessionDetail.alias || '', 'alias')}>
                           {copiedDetailField === 'alias' ? <Check size={12} /> : <Copy size={12} />}
                         </button>
+                      </div>
+                    )}
+                    {sessionDetailSupportsSnsTimeline && (
+                      <div className="detail-item">
+                        <Aperture size={14} />
+                        <span className="label">朋友圈</span>
+                        <span className="value">
+                          <button
+                            className="detail-inline-btn detail-sns-entry-btn"
+                            type="button"
+                            onClick={openSessionSnsTimeline}
+                          >
+                            {sessionDetailSnsCountLabel}
+                          </button>
+                        </span>
                       </div>
                     )}
                   </div>
@@ -4541,6 +6058,125 @@ function ExportPage() {
                 <div className="detail-empty">暂无详情</div>
               )}
               </aside>
+            </div>
+          )}
+
+          {sessionSnsTimelineTarget && (
+            <div className="export-session-sns-overlay" onClick={closeSessionSnsTimeline}>
+              <div
+                className="export-session-sns-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-label="联系人朋友圈"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="sns-dialog-header">
+                  <div className="sns-dialog-header-main">
+                    <div className="sns-dialog-avatar">
+                      {sessionSnsTimelineTarget.avatarUrl ? (
+                        <img src={sessionSnsTimelineTarget.avatarUrl} alt="" />
+                      ) : (
+                        <span>{getAvatarLetter(sessionSnsTimelineTarget.displayName || sessionSnsTimelineTarget.username)}</span>
+                      )}
+                    </div>
+                    <div className="sns-dialog-meta">
+                      <h4>{sessionSnsTimelineTarget.displayName}</h4>
+                      <div className="sns-dialog-username">@{sessionSnsTimelineTarget.username}</div>
+                      <div className="sns-dialog-stats">{renderSessionSnsTimelineStats()}</div>
+                    </div>
+                  </div>
+                  <div className="sns-dialog-header-actions">
+                    <div className="sns-dialog-rank-switch">
+                      <button
+                        type="button"
+                        className={`sns-dialog-rank-btn ${sessionSnsRankMode === 'likes' ? 'active' : ''}`}
+                        onClick={() => toggleSessionSnsRankMode('likes')}
+                      >
+                        点赞排行
+                      </button>
+                      <button
+                        type="button"
+                        className={`sns-dialog-rank-btn ${sessionSnsRankMode === 'comments' ? 'active' : ''}`}
+                        onClick={() => toggleSessionSnsRankMode('comments')}
+                      >
+                        评论排行
+                      </button>
+                      {sessionSnsRankMode && (
+                        <div
+                          className="sns-dialog-rank-panel"
+                          role="region"
+                          aria-label={sessionSnsRankMode === 'likes' ? '点赞排行' : '评论排行'}
+                        >
+                          {sessionSnsActiveRankings.length === 0 ? (
+                            <div className="sns-dialog-rank-empty">
+                              {sessionSnsRankMode === 'likes' ? '暂无点赞数据' : '暂无评论数据'}
+                            </div>
+                          ) : (
+                            sessionSnsActiveRankings.slice(0, 15).map((item, index) => (
+                              <div className="sns-dialog-rank-row" key={`${sessionSnsRankMode}-${item.name}`}>
+                                <span className="sns-dialog-rank-index">{index + 1}</span>
+                                <span className="sns-dialog-rank-name" title={item.name}>{item.name}</span>
+                                <span className="sns-dialog-rank-count">
+                                  {item.count.toLocaleString('zh-CN')}
+                                  {sessionSnsRankMode === 'likes' ? '次' : '条'}
+                                </span>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <button className="close-btn" type="button" onClick={closeSessionSnsTimeline}>
+                      <X size={16} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="sns-dialog-tip">
+                  在微信桌面客户端中打开这个人的朋友圈浏览，可快速把其朋友圈同步到这里。若你在乎这个人，一定要试试～
+                </div>
+
+                <div className="sns-dialog-body">
+                  {sessionSnsTimelinePosts.length > 0 && (
+                    <div className="posts-list author-timeline-posts-list export-session-sns-posts-list">
+                      {sessionSnsTimelinePosts.map((post) => (
+                        <SnsPostItem
+                          key={post.id}
+                          post={post}
+                          onPreview={(src, isVideo, liveVideoPath) => {
+                            if (isVideo) {
+                              void window.electronAPI.window.openVideoPlayerWindow(src)
+                            } else {
+                              void window.electronAPI.window.openImageViewerWindow(src, liveVideoPath || undefined)
+                            }
+                          }}
+                          onDebug={() => {}}
+                          hideAuthorMeta
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {sessionSnsTimelineLoading && (
+                    <div className="sns-dialog-status">正在加载该联系人的朋友圈...</div>
+                  )}
+
+                  {!sessionSnsTimelineLoading && sessionSnsTimelinePosts.length === 0 && (
+                    <div className="sns-dialog-status empty">该联系人暂无朋友圈</div>
+                  )}
+
+                  {!sessionSnsTimelineLoading && sessionSnsTimelineHasMore && (
+                    <button
+                      className="sns-dialog-load-more"
+                      type="button"
+                      onClick={loadMoreSessionSnsTimeline}
+                      disabled={sessionSnsTimelineLoadingMore}
+                    >
+                      {sessionSnsTimelineLoadingMore ? '正在加载...' : '加载更多'}
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </div>

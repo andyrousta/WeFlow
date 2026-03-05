@@ -99,8 +99,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('window:openImageViewerWindow', imagePath, liveVideoPath),
     openChatHistoryWindow: (sessionId: string, messageId: number) =>
       ipcRenderer.invoke('window:openChatHistoryWindow', sessionId, messageId),
-    openSessionChatWindow: (sessionId: string) =>
-      ipcRenderer.invoke('window:openSessionChatWindow', sessionId)
+    openSessionChatWindow: (
+      sessionId: string,
+      options?: {
+        source?: 'chat' | 'export'
+        initialDisplayName?: string
+        initialAvatarUrl?: string
+        initialContactType?: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+      }
+    ) =>
+      ipcRenderer.invoke('window:openSessionChatWindow', sessionId, options)
   },
 
   // 数据库路径
@@ -174,7 +182,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getSessionDetailExtra: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetailExtra', sessionId),
     getExportSessionStats: (
       sessionIds: string[],
-      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean; preferAccurateSpecialTypes?: boolean }
+      options?: {
+        includeRelations?: boolean
+        forceRefresh?: boolean
+        allowStaleCache?: boolean
+        preferAccurateSpecialTypes?: boolean
+        cacheOnly?: boolean
+      }
     ) => ipcRenderer.invoke('chat:getExportSessionStats', sessionIds, options),
     getGroupMyMessageCountHint: (chatroomId: string) =>
       ipcRenderer.invoke('chat:getGroupMyMessageCountHint', chatroomId),
@@ -339,8 +353,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getTimeline: (limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number) =>
       ipcRenderer.invoke('sns:getTimeline', limit, offset, usernames, keyword, startTime, endTime),
     getSnsUsernames: () => ipcRenderer.invoke('sns:getSnsUsernames'),
+    getUserPostCounts: () => ipcRenderer.invoke('sns:getUserPostCounts'),
     getExportStatsFast: () => ipcRenderer.invoke('sns:getExportStatsFast'),
     getExportStats: () => ipcRenderer.invoke('sns:getExportStats'),
+    getUserPostStats: (username: string) => ipcRenderer.invoke('sns:getUserPostStats', username),
     debugResource: (url: string) => ipcRenderer.invoke('sns:debugResource', url),
     proxyImage: (payload: { url: string; key?: string | number }) => ipcRenderer.invoke('sns:proxyImage', payload),
     downloadImage: (payload: { url: string; key?: string | number }) => ipcRenderer.invoke('sns:downloadImage', payload),

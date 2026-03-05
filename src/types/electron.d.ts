@@ -1,5 +1,12 @@
 import type { ChatSession, Message, Contact, ContactInfo } from './models'
 
+export interface SessionChatWindowOpenOptions {
+  source?: 'chat' | 'export'
+  initialDisplayName?: string
+  initialAvatarUrl?: string
+  initialContactType?: ContactInfo['type']
+}
+
 export interface ElectronAPI {
   window: {
     minimize: () => void
@@ -13,7 +20,7 @@ export interface ElectronAPI {
     resizeToFitVideo: (videoWidth: number, videoHeight: number) => Promise<void>
     openImageViewerWindow: (imagePath: string, liveVideoPath?: string) => Promise<void>
     openChatHistoryWindow: (sessionId: string, messageId: number) => Promise<boolean>
-    openSessionChatWindow: (sessionId: string) => Promise<boolean>
+    openSessionChatWindow: (sessionId: string, options?: SessionChatWindowOpenOptions) => Promise<boolean>
   }
   config: {
     get: (key: string) => Promise<unknown>
@@ -250,7 +257,13 @@ export interface ElectronAPI {
     }>
     getExportSessionStats: (
       sessionIds: string[],
-      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean; preferAccurateSpecialTypes?: boolean }
+      options?: {
+        includeRelations?: boolean
+        forceRefresh?: boolean
+        allowStaleCache?: boolean
+        preferAccurateSpecialTypes?: boolean
+        cacheOnly?: boolean
+      }
     ) => Promise<{
       success: boolean
       data?: Record<string, {
@@ -776,8 +789,10 @@ export interface ElectronAPI {
     onExportProgress: (callback: (payload: { current: number; total: number; status: string }) => void) => () => void
     selectExportDir: () => Promise<{ canceled: boolean; filePath?: string }>
     getSnsUsernames: () => Promise<{ success: boolean; usernames?: string[]; error?: string }>
+    getUserPostCounts: () => Promise<{ success: boolean; counts?: Record<string, number>; error?: string }>
     getExportStatsFast: () => Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number; myPosts: number | null }; error?: string }>
     getExportStats: () => Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number; myPosts: number | null }; error?: string }>
+    getUserPostStats: (username: string) => Promise<{ success: boolean; data?: { username: string; totalPosts: number }; error?: string }>
     installBlockDeleteTrigger: () => Promise<{ success: boolean; alreadyInstalled?: boolean; error?: string }>
     uninstallBlockDeleteTrigger: () => Promise<{ success: boolean; error?: string }>
     checkBlockDeleteTrigger: () => Promise<{ success: boolean; installed?: boolean; error?: string }>

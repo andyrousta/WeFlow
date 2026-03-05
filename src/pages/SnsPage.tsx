@@ -5,17 +5,31 @@ import './SnsPage.scss'
 import { SnsPost } from '../types/sns'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { SnsFilterPanel } from '../components/Sns/SnsFilterPanel'
+import { Avatar } from '../components/Avatar'
 import * as configService from '../services/config'
 
 const SNS_PAGE_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const SNS_PAGE_CACHE_POST_LIMIT = 200
 const SNS_PAGE_CACHE_SCOPE_FALLBACK = '__default__'
+const CONTACT_COUNT_SORT_DEBOUNCE_MS = 200
+const CONTACT_COUNT_BATCH_SIZE = 10
+
+type ContactPostCountStatus = 'idle' | 'loading' | 'ready'
 
 interface Contact {
     username: string
     displayName: string
     avatarUrl?: string
     type?: 'friend' | 'former_friend' | 'sns_only'
+    lastSessionTimestamp?: number
+    postCount?: number
+    postCountStatus?: ContactPostCountStatus
+}
+
+interface ContactsCountProgress {
+    resolved: number
+    total: number
+    running: boolean
 }
 
 interface SnsOverviewStats {
@@ -27,6 +41,12 @@ interface SnsOverviewStats {
 }
 
 type OverviewStatsStatus = 'loading' | 'ready' | 'error'
+
+interface AuthorTimelineTarget {
+    username: string
+    nickname: string
+    avatarUrl?: string
+}
 
 export default function SnsPage() {
     const [posts, setPosts] = useState<SnsPost[]>([])
@@ -51,10 +71,22 @@ export default function SnsPage() {
     const [contacts, setContacts] = useState<Contact[]>([])
     const [contactSearch, setContactSearch] = useState('')
     const [contactsLoading, setContactsLoading] = useState(false)
+    const [contactsCountProgress, setContactsCountProgress] = useState<ContactsCountProgress>({
+        resolved: 0,
+        total: 0,
+        running: false
+    })
 
     // UI states
     const [showJumpDialog, setShowJumpDialog] = useState(false)
     const [debugPost, setDebugPost] = useState<SnsPost | null>(null)
+    const [authorTimelineTarget, setAuthorTimelineTarget] = useState<AuthorTimelineTarget | null>(null)
+    const [authorTimelinePosts, setAuthorTimelinePosts] = useState<SnsPost[]>([])
+    const [authorTimelineLoading, setAuthorTimelineLoading] = useState(false)
+    const [authorTimelineLoadingMore, setAuthorTimelineLoadingMore] = useState(false)
+    const [authorTimelineHasMore, setAuthorTimelineHasMore] = useState(false)
+    const [authorTimelineTotalPosts, setAuthorTimelineTotalPosts] = useState<number | null>(null)
+    const [authorTimelineStatsLoading, setAuthorTimelineStatsLoading] = useState(false)
 
     // 导出相关状态
     const [showExportDialog, setShowExportDialog] = useState(false)
@@ -81,19 +113,30 @@ export default function SnsPage() {
     const [hasNewer, setHasNewer] = useState(false)
     const [loadingNewer, setLoadingNewer] = useState(false)
     const postsRef = useRef<SnsPost[]>([])
+    const contactsRef = useRef<Contact[]>([])
     const overviewStatsRef = useRef<SnsOverviewStats>(overviewStats)
     const overviewStatsStatusRef = useRef<OverviewStatsStatus>(overviewStatsStatus)
     const selectedUsernamesRef = useRef<string[]>(selectedUsernames)
     const searchKeywordRef = useRef(searchKeyword)
     const jumpTargetDateRef = useRef<Date | undefined>(jumpTargetDate)
     const cacheScopeKeyRef = useRef('')
+    const snsUserPostCountsCacheScopeKeyRef = useRef('')
     const scrollAdjustmentRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
     const contactsLoadTokenRef = useRef(0)
+    const contactsCountHydrationTokenRef = useRef(0)
+    const contactsCountBatchTimerRef = useRef<number | null>(null)
+    const authorTimelinePostsRef = useRef<SnsPost[]>([])
+    const authorTimelineLoadingRef = useRef(false)
+    const authorTimelineRequestTokenRef = useRef(0)
+    const authorTimelineStatsTokenRef = useRef(0)
 
     // Sync posts ref
     useEffect(() => {
         postsRef.current = posts
     }, [posts])
+    useEffect(() => {
+        contactsRef.current = contacts
+    }, [contacts])
     useEffect(() => {
         overviewStatsRef.current = overviewStats
     }, [overviewStats])
@@ -109,6 +152,9 @@ export default function SnsPage() {
     useEffect(() => {
         jumpTargetDateRef.current = jumpTargetDate
     }, [jumpTargetDate])
+    useEffect(() => {
+        authorTimelinePostsRef.current = authorTimelinePosts
+    }, [authorTimelinePosts])
     // 在 DOM 更新后、浏览器绘制前同步调整滚动位置，防止向上加载时页面跳动
     useLayoutEffect(() => {
         const snapshot = scrollAdjustmentRef.current;
@@ -132,6 +178,43 @@ export default function SnsPage() {
         return `${year}-${month}-${day}`
     }
 
+    const decodeHtmlEntities = (text: string): string => {
+        if (!text) return ''
+        return text
+            .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+            .replace(/&amp;/gi, '&')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'")
+            .trim()
+    }
+
+    const normalizePostCount = useCallback((value: unknown): number => {
+        const numeric = Number(value)
+        if (!Number.isFinite(numeric)) return 0
+        return Math.max(0, Math.floor(numeric))
+    }, [])
+
+    const compareContactsForRanking = useCallback((a: Contact, b: Contact): number => {
+        const aReady = a.postCountStatus === 'ready'
+        const bReady = b.postCountStatus === 'ready'
+        if (aReady && bReady) {
+            const countDiff = normalizePostCount(b.postCount) - normalizePostCount(a.postCount)
+            if (countDiff !== 0) return countDiff
+        } else if (aReady !== bReady) {
+            return aReady ? -1 : 1
+        }
+
+        const tsDiff = Number(b.lastSessionTimestamp || 0) - Number(a.lastSessionTimestamp || 0)
+        if (tsDiff !== 0) return tsDiff
+        return (a.displayName || a.username).localeCompare((b.displayName || b.username), 'zh-Hans-CN')
+    }, [normalizePostCount])
+
+    const sortContactsForRanking = useCallback((input: Contact[]): Contact[] => {
+        return [...input].sort(compareContactsForRanking)
+    }, [compareContactsForRanking])
+
     const isDefaultViewNow = useCallback(() => {
         return selectedUsernamesRef.current.length === 0 && !searchKeywordRef.current.trim() && !jumpTargetDateRef.current
     }, [])
@@ -141,6 +224,21 @@ export default function SnsPage() {
         const wxid = (await configService.getMyWxid())?.trim() || SNS_PAGE_CACHE_SCOPE_FALLBACK
         const scopeKey = `sns_page:${wxid}`
         cacheScopeKeyRef.current = scopeKey
+        return scopeKey
+    }, [])
+
+    const ensureSnsUserPostCountsCacheScopeKey = useCallback(async () => {
+        if (snsUserPostCountsCacheScopeKeyRef.current) return snsUserPostCountsCacheScopeKeyRef.current
+        const [wxidRaw, dbPathRaw] = await Promise.all([
+            configService.getMyWxid(),
+            configService.getDbPath()
+        ])
+        const wxid = String(wxidRaw || '').trim()
+        const dbPath = String(dbPathRaw || '').trim()
+        const scopeKey = (dbPath || wxid)
+            ? `${dbPath}::${wxid}`
+            : 'default'
+        snsUserPostCountsCacheScopeKeyRef.current = scopeKey
         return scopeKey
     }, [])
 
@@ -275,8 +373,7 @@ export default function SnsPage() {
         if (overviewStatsStatus === 'loading') {
             return '统计中...'
         }
-        const myPostsLabel = overviewStats.myPosts === null ? '--' : String(overviewStats.myPosts)
-        return `共 ${overviewStats.totalPosts} 条 ｜ 我的朋友圈 ${myPostsLabel} 条 ｜ ${formatDateOnly(overviewStats.earliestTime)} ~ ${formatDateOnly(overviewStats.latestTime)} ｜ ${overviewStats.totalFriends} 位好友`
+        return `共 ${overviewStats.totalPosts} 条 ｜ ${formatDateOnly(overviewStats.earliestTime)} ~ ${formatDateOnly(overviewStats.latestTime)} ｜ ${overviewStats.totalFriends} 位好友`
     }
 
     const loadPosts = useCallback(async (options: { reset?: boolean, direction?: 'older' | 'newer' } = {}) => {
@@ -390,31 +487,235 @@ export default function SnsPage() {
         }
     }, [jumpTargetDate, persistSnsPageCache, searchKeyword, selectedUsernames])
 
-    // Load Contacts（仅加载好友/曾经好友，不再统计朋友圈条数）
+    const stopContactsCountHydration = useCallback((resetProgress = false) => {
+        contactsCountHydrationTokenRef.current += 1
+        if (contactsCountBatchTimerRef.current) {
+            window.clearTimeout(contactsCountBatchTimerRef.current)
+            contactsCountBatchTimerRef.current = null
+        }
+        if (resetProgress) {
+            setContactsCountProgress({
+                resolved: 0,
+                total: 0,
+                running: false
+            })
+        } else {
+            setContactsCountProgress((prev) => ({ ...prev, running: false }))
+        }
+    }, [])
+
+    const hydrateContactPostCounts = useCallback(async (
+        usernames: string[],
+        options?: { force?: boolean; readyUsernames?: Set<string> }
+    ) => {
+        const force = options?.force === true
+        const targets = usernames
+            .map((username) => String(username || '').trim())
+            .filter(Boolean)
+        stopContactsCountHydration(true)
+        if (targets.length === 0) return
+
+        const readySet = options?.readyUsernames || new Set(
+            contactsRef.current
+                .filter((contact) => contact.postCountStatus === 'ready' && typeof contact.postCount === 'number')
+                .map((contact) => contact.username)
+        )
+        const pendingTargets = force ? targets : targets.filter((username) => !readySet.has(username))
+        const runToken = ++contactsCountHydrationTokenRef.current
+        const totalTargets = targets.length
+        const targetSet = new Set(pendingTargets)
+
+        if (pendingTargets.length > 0) {
+            setContacts((prev) => {
+                let changed = false
+                const next = prev.map((contact) => {
+                    if (!targetSet.has(contact.username)) return contact
+                    if (contact.postCountStatus === 'loading' && typeof contact.postCount !== 'number') return contact
+                    changed = true
+                    return {
+                        ...contact,
+                        postCount: force ? undefined : contact.postCount,
+                        postCountStatus: 'loading' as ContactPostCountStatus
+                    }
+                })
+                return changed ? sortContactsForRanking(next) : prev
+            })
+        }
+        const preResolved = Math.max(0, totalTargets - pendingTargets.length)
+        setContactsCountProgress({
+            resolved: preResolved,
+            total: totalTargets,
+            running: pendingTargets.length > 0
+        })
+        if (pendingTargets.length === 0) return
+
+        let normalizedCounts: Record<string, number> = {}
+        try {
+            const result = await window.electronAPI.sns.getUserPostCounts()
+            if (runToken !== contactsCountHydrationTokenRef.current) return
+            if (result.success && result.counts) {
+                normalizedCounts = Object.fromEntries(
+                    Object.entries(result.counts).map(([username, value]) => [username, normalizePostCount(value)])
+                )
+                void (async () => {
+                    try {
+                        const scopeKey = await ensureSnsUserPostCountsCacheScopeKey()
+                        await configService.setExportSnsUserPostCountsCache(scopeKey, normalizedCounts)
+                    } catch (cacheError) {
+                        console.error('Failed to persist SNS user post counts cache:', cacheError)
+                    }
+                })()
+            }
+        } catch (error) {
+            console.error('Failed to load contact post counts:', error)
+        }
+
+        let resolved = preResolved
+        let cursor = 0
+        const applyBatch = () => {
+            if (runToken !== contactsCountHydrationTokenRef.current) return
+
+            const batch = pendingTargets.slice(cursor, cursor + CONTACT_COUNT_BATCH_SIZE)
+            if (batch.length === 0) {
+                setContactsCountProgress({
+                    resolved: totalTargets,
+                    total: totalTargets,
+                    running: false
+                })
+                contactsCountBatchTimerRef.current = null
+                return
+            }
+
+            const batchSet = new Set(batch)
+            setContacts((prev) => {
+                let changed = false
+                const next = prev.map((contact) => {
+                    if (!batchSet.has(contact.username)) return contact
+                    const nextCount = normalizePostCount(normalizedCounts[contact.username])
+                    if (contact.postCountStatus === 'ready' && contact.postCount === nextCount) return contact
+                    changed = true
+                    return {
+                        ...contact,
+                        postCount: nextCount,
+                        postCountStatus: 'ready' as ContactPostCountStatus
+                    }
+                })
+                return changed ? sortContactsForRanking(next) : prev
+            })
+
+            resolved += batch.length
+            cursor += batch.length
+            setContactsCountProgress({
+                resolved,
+                total: totalTargets,
+                running: resolved < totalTargets
+            })
+
+            if (cursor < totalTargets) {
+                contactsCountBatchTimerRef.current = window.setTimeout(applyBatch, CONTACT_COUNT_SORT_DEBOUNCE_MS)
+            } else {
+                contactsCountBatchTimerRef.current = null
+            }
+        }
+
+        applyBatch()
+    }, [normalizePostCount, sortContactsForRanking, stopContactsCountHydration])
+
+    // Load Contacts（先按最近会话显示联系人，再异步统计朋友圈条数并增量排序）
     const loadContacts = useCallback(async () => {
         const requestToken = ++contactsLoadTokenRef.current
+        stopContactsCountHydration(true)
         setContactsLoading(true)
         try {
-            const contactsResult = await window.electronAPI.chat.getContacts()
+            const snsPostCountsScopeKey = await ensureSnsUserPostCountsCacheScopeKey()
+            const [cachedPostCountsItem, cachedContactsItem, cachedAvatarItem] = await Promise.all([
+                configService.getExportSnsUserPostCountsCache(snsPostCountsScopeKey),
+                configService.getContactsListCache(snsPostCountsScopeKey),
+                configService.getContactsAvatarCache(snsPostCountsScopeKey)
+            ])
+            const cachedPostCounts = cachedPostCountsItem?.counts || {}
+            const cachedAvatarMap = cachedAvatarItem?.avatars || {}
+            const cachedContacts = (cachedContactsItem?.contacts || [])
+                .filter((contact) => contact.type === 'friend' || contact.type === 'former_friend')
+                .map((contact) => {
+                    const cachedCount = cachedPostCounts[contact.username]
+                    const hasCachedCount = typeof cachedCount === 'number' && Number.isFinite(cachedCount)
+                    return {
+                        username: contact.username,
+                        displayName: contact.displayName || contact.username,
+                        avatarUrl: cachedAvatarMap[contact.username]?.avatarUrl,
+                        type: (contact.type === 'former_friend' ? 'former_friend' : 'friend') as 'friend' | 'former_friend',
+                        lastSessionTimestamp: 0,
+                        postCount: hasCachedCount ? Math.max(0, Math.floor(cachedCount)) : undefined,
+                        postCountStatus: hasCachedCount ? 'ready' as ContactPostCountStatus : 'idle' as ContactPostCountStatus
+                    }
+                })
+
+            if (requestToken !== contactsLoadTokenRef.current) return
+            if (cachedContacts.length > 0) {
+                const cachedContactsSorted = sortContactsForRanking(cachedContacts)
+                setContacts(cachedContactsSorted)
+                setContactsLoading(false)
+                const cachedReadyCount = cachedContactsSorted.filter(contact => contact.postCountStatus === 'ready').length
+                setContactsCountProgress({
+                    resolved: cachedReadyCount,
+                    total: cachedContactsSorted.length,
+                    running: cachedReadyCount < cachedContactsSorted.length
+                })
+            }
+
+            const [contactsResult, sessionsResult] = await Promise.all([
+                window.electronAPI.chat.getContacts(),
+                window.electronAPI.chat.getSessions()
+            ])
             const contactMap = new Map<string, Contact>()
+            const sessionTimestampMap = new Map<string, number>()
+
+            if (sessionsResult.success && Array.isArray(sessionsResult.sessions)) {
+                for (const session of sessionsResult.sessions) {
+                    const username = String(session?.username || '').trim()
+                    if (!username) continue
+                    const ts = Math.max(
+                        Number(session?.sortTimestamp || 0),
+                        Number(session?.lastTimestamp || 0)
+                    )
+                    const prevTs = Number(sessionTimestampMap.get(username) || 0)
+                    if (ts > prevTs) {
+                        sessionTimestampMap.set(username, ts)
+                    }
+                }
+            }
 
             if (contactsResult.success && contactsResult.contacts) {
                 for (const c of contactsResult.contacts) {
                     if (c.type === 'friend' || c.type === 'former_friend') {
+                        const cachedCount = cachedPostCounts[c.username]
+                        const hasCachedCount = typeof cachedCount === 'number' && Number.isFinite(cachedCount)
                         contactMap.set(c.username, {
                             username: c.username,
                             displayName: c.displayName,
                             avatarUrl: c.avatarUrl,
-                            type: c.type === 'former_friend' ? 'former_friend' : 'friend'
+                            type: c.type === 'former_friend' ? 'former_friend' : 'friend',
+                            lastSessionTimestamp: Number(sessionTimestampMap.get(c.username) || 0),
+                            postCount: hasCachedCount ? Math.max(0, Math.floor(cachedCount)) : undefined,
+                            postCountStatus: hasCachedCount ? 'ready' : 'idle'
                         })
                     }
                 }
             }
 
-            let contactsList = Array.from(contactMap.values())
-
+            let contactsList = sortContactsForRanking(Array.from(contactMap.values()))
             if (requestToken !== contactsLoadTokenRef.current) return
             setContacts(contactsList)
+            const readyUsernames = new Set(
+                contactsList
+                    .filter((contact) => contact.postCountStatus === 'ready' && typeof contact.postCount === 'number')
+                    .map((contact) => contact.username)
+            )
+            void hydrateContactPostCounts(
+                contactsList.map(contact => contact.username),
+                { readyUsernames }
+            )
 
             const allUsernames = contactsList.map(c => c.username)
 
@@ -422,7 +723,7 @@ export default function SnsPage() {
             if (allUsernames.length > 0) {
                 const enriched = await window.electronAPI.chat.enrichSessionsContactInfo(allUsernames)
                 if (enriched.success && enriched.contacts) {
-                    contactsList = contactsList.map(contact => {
+                    contactsList = contactsList.map((contact) => {
                         const extra = enriched.contacts?.[contact.username]
                         if (!extra) return contact
                         return {
@@ -432,18 +733,177 @@ export default function SnsPage() {
                         }
                     })
                     if (requestToken !== contactsLoadTokenRef.current) return
-                    setContacts(contactsList)
+                    setContacts((prev) => {
+                        const prevMap = new Map(prev.map((contact) => [contact.username, contact]))
+                        const merged = contactsList.map((contact) => {
+                            const previous = prevMap.get(contact.username)
+                            return {
+                                ...contact,
+                                lastSessionTimestamp: previous?.lastSessionTimestamp ?? contact.lastSessionTimestamp,
+                                postCount: previous?.postCount,
+                                postCountStatus: previous?.postCountStatus ?? contact.postCountStatus
+                            }
+                        })
+                        return sortContactsForRanking(merged)
+                    })
                 }
             }
         } catch (error) {
             if (requestToken !== contactsLoadTokenRef.current) return
             console.error('Failed to load contacts:', error)
+            stopContactsCountHydration(true)
         } finally {
             if (requestToken === contactsLoadTokenRef.current) {
                 setContactsLoading(false)
             }
         }
+    }, [ensureSnsUserPostCountsCacheScopeKey, hydrateContactPostCounts, sortContactsForRanking, stopContactsCountHydration])
+
+    const closeAuthorTimeline = useCallback(() => {
+        authorTimelineRequestTokenRef.current += 1
+        authorTimelineStatsTokenRef.current += 1
+        authorTimelineLoadingRef.current = false
+        setAuthorTimelineTarget(null)
+        setAuthorTimelinePosts([])
+        setAuthorTimelineLoading(false)
+        setAuthorTimelineLoadingMore(false)
+        setAuthorTimelineHasMore(false)
+        setAuthorTimelineTotalPosts(null)
+        setAuthorTimelineStatsLoading(false)
     }, [])
+
+    const loadAuthorTimelineTotalPosts = useCallback(async (target: AuthorTimelineTarget) => {
+        const requestToken = ++authorTimelineStatsTokenRef.current
+        setAuthorTimelineStatsLoading(true)
+        setAuthorTimelineTotalPosts(null)
+
+        try {
+            const result = await window.electronAPI.sns.getUserPostCounts()
+            if (requestToken !== authorTimelineStatsTokenRef.current) return
+
+            if (result.success && result.counts) {
+                const totalPosts = result.counts[target.username] ?? 0
+                setAuthorTimelineTotalPosts(Math.max(0, Number(totalPosts || 0)))
+            } else {
+                setAuthorTimelineTotalPosts(null)
+            }
+        } catch (error) {
+            console.error('Failed to load author timeline total posts:', error)
+            if (requestToken === authorTimelineStatsTokenRef.current) {
+                setAuthorTimelineTotalPosts(null)
+            }
+        } finally {
+            if (requestToken === authorTimelineStatsTokenRef.current) {
+                setAuthorTimelineStatsLoading(false)
+            }
+        }
+    }, [])
+
+    const loadAuthorTimelinePosts = useCallback(async (target: AuthorTimelineTarget, options: { reset?: boolean } = {}) => {
+        const { reset = false } = options
+        if (authorTimelineLoadingRef.current) return
+
+        authorTimelineLoadingRef.current = true
+        if (reset) {
+            setAuthorTimelineLoading(true)
+            setAuthorTimelineLoadingMore(false)
+            setAuthorTimelineHasMore(false)
+        } else {
+            setAuthorTimelineLoadingMore(true)
+        }
+
+        const requestToken = ++authorTimelineRequestTokenRef.current
+
+        try {
+            const limit = 20
+            let endTs: number | undefined = undefined
+
+            if (!reset && authorTimelinePostsRef.current.length > 0) {
+                endTs = authorTimelinePostsRef.current[authorTimelinePostsRef.current.length - 1].createTime - 1
+            }
+
+            const result = await window.electronAPI.sns.getTimeline(
+                limit,
+                0,
+                [target.username],
+                '',
+                undefined,
+                endTs
+            )
+
+            if (requestToken !== authorTimelineRequestTokenRef.current) return
+            if (!result.success || !result.timeline) {
+                if (reset) {
+                    setAuthorTimelinePosts([])
+                    setAuthorTimelineHasMore(false)
+                }
+                return
+            }
+
+            if (reset) {
+                const sorted = [...result.timeline].sort((a, b) => b.createTime - a.createTime)
+                setAuthorTimelinePosts(sorted)
+                setAuthorTimelineHasMore(result.timeline.length >= limit)
+                return
+            }
+
+            const existingIds = new Set(authorTimelinePostsRef.current.map((p) => p.id))
+            const uniqueOlder = result.timeline.filter((p) => !existingIds.has(p.id))
+            if (uniqueOlder.length > 0) {
+                const merged = [...authorTimelinePostsRef.current, ...uniqueOlder].sort((a, b) => b.createTime - a.createTime)
+                setAuthorTimelinePosts(merged)
+            }
+            if (result.timeline.length < limit) {
+                setAuthorTimelineHasMore(false)
+            }
+        } catch (error) {
+            console.error('Failed to load author timeline:', error)
+            if (requestToken === authorTimelineRequestTokenRef.current && reset) {
+                setAuthorTimelinePosts([])
+                setAuthorTimelineHasMore(false)
+            }
+        } finally {
+            if (requestToken === authorTimelineRequestTokenRef.current) {
+                authorTimelineLoadingRef.current = false
+                setAuthorTimelineLoading(false)
+                setAuthorTimelineLoadingMore(false)
+            }
+        }
+    }, [])
+
+    const openAuthorTimeline = useCallback((post: SnsPost) => {
+        authorTimelineRequestTokenRef.current += 1
+        authorTimelineLoadingRef.current = false
+        const target = {
+            username: post.username,
+            nickname: post.nickname,
+            avatarUrl: post.avatarUrl
+        }
+        setAuthorTimelineTarget(target)
+        setAuthorTimelinePosts([])
+        setAuthorTimelineHasMore(false)
+        setAuthorTimelineTotalPosts(null)
+        void loadAuthorTimelinePosts(target, { reset: true })
+        void loadAuthorTimelineTotalPosts(target)
+    }, [loadAuthorTimelinePosts, loadAuthorTimelineTotalPosts])
+
+    const loadMoreAuthorTimeline = useCallback(() => {
+        if (!authorTimelineTarget || authorTimelineLoading || authorTimelineLoadingMore || !authorTimelineHasMore) return
+        void loadAuthorTimelinePosts(authorTimelineTarget, { reset: false })
+    }, [authorTimelineHasMore, authorTimelineLoading, authorTimelineLoadingMore, authorTimelineTarget, loadAuthorTimelinePosts])
+
+    const handlePostDelete = useCallback((postId: string, username: string) => {
+        setPosts(prev => {
+            const next = prev.filter(p => p.id !== postId)
+            void persistSnsPageCache({ posts: next })
+            return next
+        })
+        setAuthorTimelinePosts(prev => prev.filter(p => p.id !== postId))
+        if (authorTimelineTarget && authorTimelineTarget.username === username) {
+            setAuthorTimelineTotalPosts(prev => prev === null ? null : Math.max(0, prev - 1))
+        }
+        void loadOverviewStats()
+    }, [authorTimelineTarget, loadOverviewStats, persistSnsPageCache])
 
     // Initial Load & Listeners
     useEffect(() => {
@@ -453,9 +913,22 @@ export default function SnsPage() {
     }, [hydrateSnsPageCache, loadContacts, loadOverviewStats])
 
     useEffect(() => {
+        return () => {
+            contactsCountHydrationTokenRef.current += 1
+            if (contactsCountBatchTimerRef.current) {
+                window.clearTimeout(contactsCountBatchTimerRef.current)
+                contactsCountBatchTimerRef.current = null
+            }
+        }
+    }, [])
+
+    useEffect(() => {
         const handleChange = () => {
             cacheScopeKeyRef.current = ''
+            snsUserPostCountsCacheScopeKeyRef.current = ''
             // wxid changed, reset everything
+            stopContactsCountHydration(true)
+            setContacts([])
             setPosts([]); setHasMore(true); setHasNewer(false);
             setSelectedUsernames([]); setSearchKeyword(''); setJumpTargetDate(undefined);
             void hydrateSnsPageCache()
@@ -465,7 +938,7 @@ export default function SnsPage() {
         }
         window.addEventListener('wxid-changed', handleChange as EventListener)
         return () => window.removeEventListener('wxid-changed', handleChange as EventListener)
-    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats, loadPosts])
+    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats, loadPosts, stopContactsCountHydration])
 
     useEffect(() => {
         const timer = setTimeout(() => {
@@ -473,6 +946,24 @@ export default function SnsPage() {
         }, 500)
         return () => clearTimeout(timer)
     }, [selectedUsernames, searchKeyword, jumpTargetDate, loadPosts])
+
+    useEffect(() => {
+        if (!authorTimelineTarget) return
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                closeAuthorTimeline()
+            }
+        }
+        window.addEventListener('keydown', handleKeyDown)
+        return () => window.removeEventListener('keydown', handleKeyDown)
+    }, [authorTimelineTarget, closeAuthorTimeline])
+
+    useEffect(() => {
+        if (authorTimelineTotalPosts === null) return
+        if (authorTimelinePosts.length >= authorTimelineTotalPosts) {
+            setAuthorTimelineHasMore(false)
+        }
+    }, [authorTimelinePosts.length, authorTimelineTotalPosts])
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, clientHeight, scrollHeight } = e.currentTarget
@@ -490,6 +981,29 @@ export default function SnsPage() {
         if (e.deltaY < -20 && container.scrollTop <= 0 && hasNewer && !loading && !loadingNewer) {
             loadPosts({ direction: 'newer' })
         }
+    }
+
+    const handleAuthorTimelineScroll = (e: React.UIEvent<HTMLDivElement>) => {
+        const { scrollTop, clientHeight, scrollHeight } = e.currentTarget
+        if (scrollHeight - scrollTop - clientHeight < 260) {
+            loadMoreAuthorTimeline()
+        }
+    }
+
+    const renderAuthorTimelineStats = () => {
+        const loadedCount = authorTimelinePosts.length
+        const loadPart = authorTimelineStatsLoading
+            ? `已加载 ${loadedCount} / 总数统计中...`
+            : authorTimelineTotalPosts === null
+                ? `已加载 ${loadedCount} 条`
+                : `已加载 ${loadedCount} / 共 ${authorTimelineTotalPosts} 条`
+
+        if (authorTimelineLoading && loadedCount === 0) return `${loadPart} ｜ 加载中...`
+        if (loadedCount === 0) return loadPart
+
+        const latest = authorTimelinePosts[0]?.createTime ?? null
+        const earliest = authorTimelinePosts[authorTimelinePosts.length - 1]?.createTime ?? null
+        return `${loadPart} ｜ ${formatDateOnly(earliest)} ~ ${formatDateOnly(latest)}`
     }
 
     return (
@@ -578,14 +1092,8 @@ export default function SnsPage() {
                                         }
                                     }}
                                     onDebug={(p) => setDebugPost(p)}
-                                    onDelete={(postId) => {
-                                        setPosts(prev => {
-                                            const next = prev.filter(p => p.id !== postId)
-                                            void persistSnsPageCache({ posts: next })
-                                            return next
-                                        })
-                                        loadOverviewStats()
-                                    }}
+                                    onDelete={handlePostDelete}
+                                    onOpenAuthorPosts={openAuthorTimeline}
                                 />
                             ))}
                         </div>
@@ -644,6 +1152,7 @@ export default function SnsPage() {
                 contactSearch={contactSearch}
                 setContactSearch={setContactSearch}
                 loading={contactsLoading}
+                contactsCountProgress={contactsCountProgress}
             />
 
             {/* Dialogs and Overlays */}
@@ -656,6 +1165,77 @@ export default function SnsPage() {
                 }}
                 currentDate={jumpTargetDate || new Date()}
             />
+
+            {authorTimelineTarget && (
+                <div className="modal-overlay" onClick={closeAuthorTimeline}>
+                    <div className="author-timeline-dialog" onClick={(e) => e.stopPropagation()}>
+                        <div className="author-timeline-header">
+                            <div className="author-timeline-meta">
+                                <Avatar
+                                    src={authorTimelineTarget.avatarUrl}
+                                    name={authorTimelineTarget.nickname}
+                                    size={42}
+                                    shape="rounded"
+                                />
+                                <div className="author-timeline-meta-text">
+                                    <h3>{decodeHtmlEntities(authorTimelineTarget.nickname)}</h3>
+                                    <div className="author-timeline-username">@{authorTimelineTarget.username}</div>
+                                    <div className="author-timeline-stats">{renderAuthorTimelineStats()}</div>
+                                </div>
+                            </div>
+                            <button className="close-btn" onClick={closeAuthorTimeline}>
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        <div className="author-timeline-body" onScroll={handleAuthorTimelineScroll}>
+                            {authorTimelinePosts.length > 0 && (
+                                <div className="posts-list author-timeline-posts-list">
+                                    {authorTimelinePosts.map(post => (
+                                        <SnsPostItem
+                                            key={post.id}
+                                            post={{ ...post, isProtected: triggerInstalled === true }}
+                                            onPreview={(src, isVideo, liveVideoPath) => {
+                                                if (isVideo) {
+                                                    void window.electronAPI.window.openVideoPlayerWindow(src)
+                                                } else {
+                                                    void window.electronAPI.window.openImageViewerWindow(src, liveVideoPath || undefined)
+                                                }
+                                            }}
+                                            onDebug={(p) => setDebugPost(p)}
+                                            onDelete={handlePostDelete}
+                                            onOpenAuthorPosts={openAuthorTimeline}
+                                            hideAuthorMeta
+                                        />
+                                    ))}
+                                </div>
+                            )}
+
+                            {authorTimelineLoading && (
+                                <div className="status-indicator loading-more author-timeline-loading">
+                                    <RefreshCw size={16} className="spinning" />
+                                    <span>正在加载该用户朋友圈...</span>
+                                </div>
+                            )}
+
+                            {!authorTimelineLoading && authorTimelinePosts.length === 0 && (
+                                <div className="author-timeline-empty">该用户暂无朋友圈</div>
+                            )}
+
+                            {!authorTimelineLoading && authorTimelineHasMore && (
+                                <button
+                                    type="button"
+                                    className="author-timeline-load-more"
+                                    onClick={loadMoreAuthorTimeline}
+                                    disabled={authorTimelineLoadingMore}
+                                >
+                                    {authorTimelineLoadingMore ? '正在加载...' : '加载更多'}
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {debugPost && (
                 <div className="modal-overlay" onClick={() => setDebugPost(null)}>

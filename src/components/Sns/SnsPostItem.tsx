@@ -243,10 +243,12 @@ interface SnsPostItemProps {
     post: SnsPost
     onPreview: (src: string, isVideo?: boolean, liveVideoPath?: string) => void
     onDebug: (post: SnsPost) => void
-    onDelete?: (postId: string) => void
+    onDelete?: (postId: string, username: string) => void
+    onOpenAuthorPosts?: (post: SnsPost) => void
+    hideAuthorMeta?: boolean
 }
 
-export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDebug, onDelete }) => {
+export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDebug, onDelete, onOpenAuthorPosts, hideAuthorMeta = false }) => {
     const [mediaDeleted, setMediaDeleted] = useState(false)
     const [dbDeleted, setDbDeleted] = useState(false)
     const [deleting, setDeleting] = useState(false)
@@ -299,31 +301,56 @@ export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDeb
             const r = await window.electronAPI.sns.deleteSnsPost(post.tid ?? post.id)
             if (r.success) {
                 setDbDeleted(true)
-                onDelete?.(post.id)
+                onDelete?.(post.id, post.username)
             }
         } finally {
             setDeleting(false)
         }
     }
 
+    const handleOpenAuthorPosts = (e: React.MouseEvent) => {
+        e.stopPropagation()
+        onOpenAuthorPosts?.(post)
+    }
+
     return (
         <>
         <div className={`sns-post-item ${(mediaDeleted || dbDeleted) ? 'post-deleted' : ''}`}>
-            <div className="post-avatar-col">
-                <Avatar
-                    src={post.avatarUrl}
-                    name={post.nickname}
-                    size={48}
-                    shape="rounded"
-                />
-            </div>
+            {!hideAuthorMeta && (
+                <div className="post-avatar-col">
+                    <button
+                        type="button"
+                        className="author-trigger-btn avatar-trigger"
+                        onClick={handleOpenAuthorPosts}
+                        title="查看该发布者的全部朋友圈"
+                    >
+                        <Avatar
+                            src={post.avatarUrl}
+                            name={post.nickname}
+                            size={48}
+                            shape="rounded"
+                        />
+                    </button>
+                </div>
+            )}
 
             <div className="post-content-col">
                 <div className="post-header-row">
-                    <div className="post-author-info">
-                        <span className="author-name">{decodeHtmlEntities(post.nickname)}</span>
-                        <span className="post-time">{formatTime(post.createTime)}</span>
-                    </div>
+                    {hideAuthorMeta ? (
+                        <span className="post-time post-time-standalone">{formatTime(post.createTime)}</span>
+                    ) : (
+                        <div className="post-author-info">
+                            <button
+                                type="button"
+                                className="author-trigger-btn author-name-trigger"
+                                onClick={handleOpenAuthorPosts}
+                                title="查看该发布者的全部朋友圈"
+                            >
+                                <span className="author-name">{decodeHtmlEntities(post.nickname)}</span>
+                            </button>
+                            <span className="post-time">{formatTime(post.createTime)}</span>
+                        </div>
+                    )}
                     <div className="post-header-actions">
                         {(mediaDeleted || dbDeleted) && (
                             <span className="post-deleted-badge">
