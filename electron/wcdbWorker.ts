@@ -174,7 +174,15 @@ if (parentPort) {
                 case 'deleteMessage':
                     result = await core.deleteMessage(payload.sessionId, payload.localId, payload.createTime, payload.dbPathHint)
                     break
-
+                case 'cloudInit':
+                    result = await core.cloudInit(payload.intervalSeconds)
+                    break
+                case 'cloudReport':
+                    result = await core.cloudReport(payload.statsJson)
+                    break
+                case 'cloudStop':
+                    result = core.cloudStop()
+                    break
                 default:
                     result = { success: false, error: `Unknown method: ${type}` }
             }

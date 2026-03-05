@@ -784,6 +784,11 @@ export interface ElectronAPI {
     deleteSnsPost: (postId: string) => Promise<{ success: boolean; error?: string }>
     downloadEmoji: (params: { url: string; encryptUrl?: string; aesKey?: string }) => Promise<{ success: boolean; localPath?: string; error?: string }>
   }
+  cloud: {
+    init: () => Promise<void>
+    recordPage: (pageName: string) => Promise<void>
+    getLogs: () => Promise<string[]>
+  }
   http: {
     start: (port?: number) => Promise<{ success: boolean; port?: number; error?: string }>
     stop: () => Promise<{ success: boolean }>

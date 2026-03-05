@@ -61,7 +61,10 @@ export const CONFIG_KEYS = {
   NOTIFICATION_FILTER_LIST: 'notificationFilterList',
 
   // 词云
-  WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords'
+  WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords',
+
+  // 数据收集
+  ANALYTICS_CONSENT: 'analyticsConsent'
 } as const
 
 export interface WxidConfig {
@@ -1082,4 +1085,16 @@ export async function getWordCloudExcludeWords(): Promise<string[]> {
 // 设置词云排除词列表
 export async function setWordCloudExcludeWords(words: string[]): Promise<void> {
   await config.set(CONFIG_KEYS.WORD_CLOUD_EXCLUDE_WORDS, words)
+}
+
+// 获取数据收集同意状态
+export async function getAnalyticsConsent(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.ANALYTICS_CONSENT)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置数据收集同意状态
+export async function setAnalyticsConsent(consent: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.ANALYTICS_CONSENT, consent)
 }

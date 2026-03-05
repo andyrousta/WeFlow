@@ -4601,8 +4601,8 @@ class ChatService {
   private shouldKeepSession(username: string): boolean {
     if (!username) return false
     const lowered = username.toLowerCase()
-    // placeholder_foldgroup 是折叠群入口，需要保留
-    if (lowered.includes('@placeholder') && !lowered.includes('foldgroup')) return false
+    // 排除所有 placeholder 会话（包括折叠群）
+    if (lowered.includes('@placeholder')) return false
     if (username.startsWith('gh_')) return false
 
     const excludeList = [

@@ -936,20 +936,6 @@ class SnsService {
         const result = await wcdbService.getSnsTimeline(limit, offset, usernames, keyword, startTime, endTime)
         if (!result.success || !result.timeline || result.timeline.length === 0) return result
 
-        // 诊断：测试 execQuery 查 content 字段
-        try {
-            const testResult = await wcdbService.execQuery('sns', null, 'SELECT tid, CAST(content AS TEXT) as ct, typeof(content) as ctype FROM SnsTimeLine ORDER BY tid DESC LIMIT 1')
-            if (testResult.success && testResult.rows?.[0]) {
-                const r = testResult.rows[0]
-                console.log('[SnsService] execQuery 诊断: ctype=', r.ctype, 'ct长度=', r.ct?.length, 'ct前200=', r.ct?.substring(0, 200))
-                console.log('[SnsService] ct包含CommentUserList:', r.ct?.includes('CommentUserList'))
-            } else {
-                console.log('[SnsService] execQuery 诊断失败:', testResult.error)
-            }
-        } catch (e) {
-            console.log('[SnsService] execQuery 诊断异常:', e)
-        }
-
         const enrichedTimeline = result.timeline.map((post: any) => {
             const contact = this.contactCache.get(post.username)
             const isVideoPost = post.type === 15

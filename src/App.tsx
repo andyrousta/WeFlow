@@ -26,6 +26,7 @@ import NotificationWindow from './pages/NotificationWindow'
 import { useAppStore } from './stores/appStore'
 import { themes, useThemeStore, type ThemeId, type ThemeMode } from './stores/themeStore'
 import * as configService from './services/config'
+import * as cloudControl from './services/cloudControl'
 import { Download, X, Shield } from 'lucide-react'
 import './App.scss'
 
@@ -76,6 +77,9 @@ function App() {
   const [showAgreement, setShowAgreement] = useState(false)
   const [agreementChecked, setAgreementChecked] = useState(false)
   const [agreementLoading, setAgreementLoading] = useState(true)
+
+  // 数据收集同意状态
+  const [showAnalyticsConsent, setShowAnalyticsConsent] = useState(false)
 
   useEffect(() => {
     const root = document.documentElement
@@ -172,6 +176,12 @@ function App() {
         const agreed = await configService.getAgreementAccepted()
         if (!agreed) {
           setShowAgreement(true)
+        } else {
+          // 协议已同意，检查数据收集同意状态
+          const consent = await configService.getAnalyticsConsent()
+          if (consent === null) {
+            setShowAnalyticsConsent(true)
+          }
         }
       } catch (e) {
         console.error('检查协议状态失败:', e)
@@ -182,13 +192,41 @@ function App() {
     checkAgreement()
   }, [])
 
+  // 初始化数据收集
+  useEffect(() => {
+    cloudControl.initCloudControl()
+  }, [])
+
+  // 记录页面访问
+  useEffect(() => {
+    const path = location.pathname
+    if (path && path !== '/') {
+      cloudControl.recordPage(path)
+    }
+  }, [location.pathname])
+
   const handleAgree = async () => {
     if (!agreementChecked) return
     await configService.setAgreementAccepted(true)
     setShowAgreement(false)
+    // 协议同意后，检查数据收集同意
+    const consent = await configService.getAnalyticsConsent()
+    if (consent === null) {
+      setShowAnalyticsConsent(true)
+    }
   }
 
   const handleDisagree = () => {
+    window.electronAPI.window.close()
+  }
+
+  const handleAnalyticsAllow = async () => {
+    await configService.setAnalyticsConsent(true)
+    setShowAnalyticsConsent(false)
+  }
+
+  const handleAnalyticsDeny = async () => {
+    await configService.setAnalyticsConsent(false)
     window.electronAPI.window.close()
   }
 
@@ -441,6 +479,42 @@ function App() {
               <div className="agreement-actions">
                 <button className="btn btn-secondary" onClick={handleDisagree}>不同意</button>
                 <button className="btn btn-primary" onClick={handleAgree} disabled={!agreementChecked}>同意并继续</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 数据收集同意弹窗 */}
+      {showAnalyticsConsent && !agreementLoading && (
+        <div className="agreement-overlay">
+          <div className="agreement-modal">
+            <div className="agreement-header">
+              <Shield size={32} />
+              <h2>使用数据收集说明</h2>
+            </div>
+            <div className="agreement-content">
+              <div className="agreement-text">
+                <p>为了持续改进 WeFlow 并提供更好的用户体验，我们希望收集一些匿名的使用数据。</p>
+
+                <h4>我们会收集什么？</h4>
+                <p>• 功能使用情况（如哪些功能被使用、使用频率）</p>
+                <p>• 应用性能数据（如加载时间、错误日志）</p>
+                <p>• 设备基本信息（如操作系统版本、应用版本）</p>
+
+                <h4>我们不会收集什么？</h4>
+                <p>• 你的聊天记录内容</p>
+                <p>• 个人身份信息</p>
+                <p>• 联系人信息</p>
+                <p>• 任何可以识别你身份的数据</p>
+                <p>• 一切你担心会涉及隐藏的数据</p>
+
+              </div>
+            </div>
+            <div className="agreement-footer">
+              <div className="agreement-actions">
+                <button className="btn btn-secondary" onClick={handleAnalyticsDeny}>不允许</button>
+                <button className="btn btn-primary" onClick={handleAnalyticsAllow}>允许</button>
               </div>
             </div>
           </div>
