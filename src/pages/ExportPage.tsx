@@ -49,6 +49,7 @@ type ContentCardType = ContentType | 'sns'
 type SessionLayout = 'shared' | 'per-session'
 
 type DisplayNamePreference = 'group-nickname' | 'remark' | 'nickname'
+type DateRangePreset = 'all' | 'today' | 'yesterday' | 'last3days' | 'last7days' | 'last30days' | 'custom'
 
 type TextExportFormat = 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone' | 'sql'
 type SnsTimelineExportFormat = 'json' | 'html' | 'arkmejson'
@@ -413,6 +414,52 @@ const formatRecentExportTime = (timestamp?: number, now = Date.now()): string =>
     return `${hours} 小时前`
   }
   return formatAbsoluteDate(timestamp)
+}
+
+const startOfDay = (date: Date): Date => {
+  const next = new Date(date)
+  next.setHours(0, 0, 0, 0)
+  return next
+}
+
+const endOfDay = (date: Date): Date => {
+  const next = new Date(date)
+  next.setHours(23, 59, 59, 999)
+  return next
+}
+
+const createDefaultDateRange = (): { start: Date; end: Date } => {
+  const now = new Date()
+  return {
+    start: startOfDay(now),
+    end: now
+  }
+}
+
+const createDateRangeByPreset = (
+  preset: Exclude<DateRangePreset, 'all' | 'custom'>,
+  now = new Date()
+): { start: Date; end: Date } => {
+  const end = new Date(now)
+  const baseStart = startOfDay(now)
+
+  if (preset === 'today') {
+    return { start: baseStart, end }
+  }
+
+  if (preset === 'yesterday') {
+    const yesterday = new Date(baseStart)
+    yesterday.setDate(yesterday.getDate() - 1)
+    return {
+      start: yesterday,
+      end: endOfDay(yesterday)
+    }
+  }
+
+  const daysBack = preset === 'last3days' ? 2 : preset === 'last7days' ? 6 : 29
+  const start = new Date(baseStart)
+  start.setDate(start.getDate() - daysBack)
+  return { start, end }
 }
 
 const formatDateInputValue = (date: Date): string => {
@@ -1108,6 +1155,8 @@ function ExportPage() {
   const [snsExportImages, setSnsExportImages] = useState(false)
   const [snsExportLivePhotos, setSnsExportLivePhotos] = useState(false)
   const [snsExportVideos, setSnsExportVideos] = useState(false)
+  const [isTimeRangeDialogOpen, setIsTimeRangeDialogOpen] = useState(false)
+  const [timeRangePreset, setTimeRangePreset] = useState<DateRangePreset>('all')
 
   const [options, setOptions] = useState<ExportOptions>({
     format: 'json',
@@ -2175,14 +2224,11 @@ function ExportPage() {
 
   const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open'>) => {
     setExportDialog({ open: true, ...payload })
+    setIsTimeRangeDialogOpen(false)
+    setTimeRangePreset('all')
 
     setOptions(prev => {
-      const nextDateRange = prev.dateRange ?? (() => {
-        const now = new Date()
-        const start = new Date(now)
-        start.setHours(0, 0, 0, 0)
-        return { start, end: now }
-      })()
+      const nextDateRange = prev.dateRange ?? createDefaultDateRange()
 
       const next: ExportOptions = {
         ...prev,
@@ -2218,7 +2264,83 @@ function ExportPage() {
 
   const closeExportDialog = useCallback(() => {
     setExportDialog(prev => ({ ...prev, open: false }))
+    setIsTimeRangeDialogOpen(false)
   }, [])
+
+  const applyTimeRangePreset = useCallback((preset: Exclude<DateRangePreset, 'custom'>) => {
+    setTimeRangePreset(preset)
+    if (preset === 'all') {
+      setOptions(prev => ({
+        ...prev,
+        useAllTime: true,
+        dateRange: prev.dateRange ?? createDefaultDateRange()
+      }))
+      return
+    }
+    const range = createDateRangeByPreset(preset)
+    setOptions(prev => ({
+      ...prev,
+      useAllTime: false,
+      dateRange: range
+    }))
+  }, [])
+
+  const activateCustomTimeRange = useCallback(() => {
+    setTimeRangePreset('custom')
+    setOptions(prev => ({
+      ...prev,
+      useAllTime: false,
+      dateRange: prev.dateRange ?? createDefaultDateRange()
+    }))
+  }, [])
+
+  const updateCustomDateRangeStart = useCallback((value: string) => {
+    const start = parseDateInput(value, false)
+    setTimeRangePreset('custom')
+    setOptions(prev => ({
+      ...prev,
+      useAllTime: false,
+      dateRange: prev.dateRange
+        ? {
+            start,
+            end: prev.dateRange.end < start ? parseDateInput(value, true) : prev.dateRange.end
+          }
+        : { start, end: new Date() }
+    }))
+  }, [])
+
+  const updateCustomDateRangeEnd = useCallback((value: string) => {
+    const end = parseDateInput(value, true)
+    setTimeRangePreset('custom')
+    setOptions(prev => ({
+      ...prev,
+      useAllTime: false,
+      dateRange: prev.dateRange
+        ? {
+            start: prev.dateRange.start > end ? parseDateInput(value, false) : prev.dateRange.start,
+            end
+          }
+        : { start: new Date(), end }
+    }))
+  }, [])
+
+  const timeRangeSummaryLabel = useMemo(() => {
+    if (options.useAllTime) return '默认导出全部时间'
+    if (timeRangePreset === 'today') return '今天'
+    if (timeRangePreset === 'yesterday') return '昨天'
+    if (timeRangePreset === 'last3days') return '最近三天'
+    if (timeRangePreset === 'last7days') return '最近一周'
+    if (timeRangePreset === 'last30days') return '最近一个月'
+    if (options.dateRange) {
+      return `${formatDateInputValue(options.dateRange.start)} 至 ${formatDateInputValue(options.dateRange.end)}`
+    }
+    return '自定义时间范围'
+  }, [options.useAllTime, options.dateRange, timeRangePreset])
+
+  const isTimeRangePresetActive = useCallback((preset: DateRangePreset): boolean => {
+    if (preset === 'all') return options.useAllTime
+    return !options.useAllTime && timeRangePreset === preset
+  }, [options.useAllTime, timeRangePreset])
 
   useEffect(() => {
     const unsubscribe = onOpenSingleExport((payload) => {
@@ -4351,57 +4473,17 @@ function ExportPage() {
               )}
 
               <div className="dialog-section">
-                <h4>时间范围</h4>
-                <div className="switch-row">
-                  <span>导出全部时间</span>
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={options.useAllTime}
-                      onChange={(event) => setOptions(prev => ({ ...prev, useAllTime: event.target.checked }))}
-                    />
-                    <span className="switch-slider"></span>
-                  </label>
+                <div className="section-header-action">
+                  <h4>时间范围</h4>
+                  <button
+                    type="button"
+                    className="time-range-trigger"
+                    onClick={() => setIsTimeRangeDialogOpen(true)}
+                  >
+                    <span>{timeRangeSummaryLabel}</span>
+                    <span className="time-range-arrow">&gt;</span>
+                  </button>
                 </div>
-
-                {!options.useAllTime && options.dateRange && (
-                  <div className="date-range-row">
-                    <label>
-                      开始
-                      <input
-                        type="date"
-                        value={formatDateInputValue(options.dateRange.start)}
-                        onChange={(event) => {
-                          const start = parseDateInput(event.target.value, false)
-                          setOptions(prev => ({
-                            ...prev,
-                            dateRange: prev.dateRange ? {
-                              start,
-                              end: prev.dateRange.end < start ? parseDateInput(event.target.value, true) : prev.dateRange.end
-                            } : { start, end: new Date() }
-                          }))
-                        }}
-                      />
-                    </label>
-                    <label>
-                      结束
-                      <input
-                        type="date"
-                        value={formatDateInputValue(options.dateRange.end)}
-                        onChange={(event) => {
-                          const end = parseDateInput(event.target.value, true)
-                          setOptions(prev => ({
-                            ...prev,
-                            dateRange: prev.dateRange ? {
-                              start: prev.dateRange.start > end ? parseDateInput(event.target.value, false) : prev.dateRange.start,
-                              end
-                            } : { start: new Date(), end }
-                          }))
-                        }}
-                      />
-                    </label>
-                  </div>
-                )}
               </div>
 
               {shouldShowMediaSection && (
@@ -4462,6 +4544,83 @@ function ExportPage() {
                 <Download size={14} /> 创建导出任务
               </button>
             </div>
+
+            {isTimeRangeDialogOpen && (
+              <div className="time-range-dialog-overlay" onClick={() => setIsTimeRangeDialogOpen(false)}>
+                <div className="time-range-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+                  <div className="time-range-dialog-header">
+                    <h4>时间范围设置</h4>
+                    <button
+                      type="button"
+                      className="close-icon-btn"
+                      onClick={() => setIsTimeRangeDialogOpen(false)}
+                      aria-label="关闭时间范围设置"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+
+                  <div className="time-range-preset-list">
+                    {([
+                      { value: 'all', label: '默认导出全部时间' },
+                      { value: 'today', label: '今天' },
+                      { value: 'yesterday', label: '昨天' },
+                      { value: 'last3days', label: '最近三天' },
+                      { value: 'last7days', label: '最近一周' },
+                      { value: 'last30days', label: '最近一个月' },
+                      { value: 'custom', label: '自定义' }
+                    ] as Array<{ value: DateRangePreset; label: string }>).map((preset) => {
+                      const isActive = isTimeRangePresetActive(preset.value)
+                      return (
+                        <button
+                          key={preset.value}
+                          type="button"
+                          className={`time-range-preset-item ${isActive ? 'active' : ''}`}
+                          onClick={() => {
+                            if (preset.value === 'custom') {
+                              activateCustomTimeRange()
+                              return
+                            }
+                            applyTimeRangePreset(preset.value)
+                            setIsTimeRangeDialogOpen(false)
+                          }}
+                        >
+                          <span>{preset.label}</span>
+                          {isActive && <Check size={14} />}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  {!options.useAllTime && timeRangePreset === 'custom' && options.dateRange && (
+                    <div className="time-range-custom-row">
+                      <label>
+                        开始日期
+                        <input
+                          type="date"
+                          value={formatDateInputValue(options.dateRange.start)}
+                          onChange={(event) => updateCustomDateRangeStart(event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        结束日期
+                        <input
+                          type="date"
+                          value={formatDateInputValue(options.dateRange.end)}
+                          onChange={(event) => updateCustomDateRangeEnd(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  <div className="time-range-dialog-actions">
+                    <button type="button" className="secondary-btn" onClick={() => setIsTimeRangeDialogOpen(false)}>
+                      完成
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>,
         document.body
