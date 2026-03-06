@@ -1716,6 +1716,8 @@
   --contacts-default-list-height: calc(var(--contacts-row-height) * var(--contacts-default-visible-rows));
   --contacts-select-col-width: 34px;
   --contacts-inline-padding: 12px;
+  --contacts-name-text-width: 10em;
+  --contacts-main-col-width: calc(44px + 12px + var(--contacts-name-text-width));
   --contacts-message-col-width: 120px;
   --contacts-media-col-width: 72px;
   --contacts-action-col-width: 140px;
@@ -1899,8 +1901,10 @@
   }
 
   .contacts-list-header-main {
-    flex: 1;
-    min-width: 0;
+    flex: 0 0 var(--contacts-main-col-width);
+    width: var(--contacts-main-col-width);
+    min-width: var(--contacts-main-col-width);
+    max-width: var(--contacts-main-col-width);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1915,21 +1919,30 @@
 
   .contacts-list-header-count {
     width: var(--contacts-message-col-width);
+    min-width: var(--contacts-message-col-width);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     text-align: center;
     flex-shrink: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    box-sizing: border-box;
   }
 
   .contacts-list-header-media {
     width: var(--contacts-media-col-width);
     min-width: var(--contacts-media-col-width);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     text-align: center;
     flex-shrink: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    box-sizing: border-box;
   }
 
   .contacts-list-header-actions {
@@ -2134,8 +2147,10 @@
   }
 
   .contact-info {
-    flex: 1;
-    min-width: 0;
+    flex: 0 0 var(--contacts-name-text-width);
+    width: var(--contacts-name-text-width);
+    min-width: var(--contacts-name-text-width);
+    max-width: var(--contacts-name-text-width);
   }
 
   .contact-name {
@@ -2178,6 +2193,7 @@
     gap: 4px;
     flex-shrink: 0;
     text-align: center;
+    box-sizing: border-box;
   }
 
   .row-media-metric {
@@ -2188,6 +2204,7 @@
     align-items: center;
     flex-shrink: 0;
     text-align: center;
+    box-sizing: border-box;
   }
 
   .row-media-metric-value {
@@ -2211,6 +2228,7 @@
     background: transparent;
     margin: 0;
     padding: 0;
+    width: 100%;
     min-height: 14px;
     display: inline-flex;
     align-items: center;
@@ -4158,6 +4176,8 @@
 
   .table-wrap {
     --contacts-inline-padding: 10px;
+    --contacts-name-text-width: 10em;
+    --contacts-main-col-width: calc(44px + 10px + var(--contacts-name-text-width));
     --contacts-message-col-width: 104px;
     --contacts-media-col-width: 62px;
     --contacts-action-col-width: 140px;
