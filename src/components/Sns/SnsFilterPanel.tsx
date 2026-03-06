@@ -22,6 +22,7 @@ interface SnsFilterPanelProps {
     setSearchKeyword: (val: string) => void
     jumpTargetDate?: Date
     setJumpTargetDate: (date?: Date) => void
+    totalFriendsLabel?: string
     selectedUsernames: string[]
     setSelectedUsernames: (val: string[]) => void
     contacts: Contact[]
@@ -36,6 +37,7 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
     setSearchKeyword,
     jumpTargetDate,
     setJumpTargetDate,
+    totalFriendsLabel,
     selectedUsernames,
     setSelectedUsernames,
     contacts,
@@ -269,6 +271,9 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                         <span>联系人</span>
                         {selectedUsernames.length > 0 && (
                             <span className="badge">{selectedUsernames.length}</span>
+                        )}
+                        {totalFriendsLabel && (
+                            <span className="widget-header-summary">{totalFriendsLabel}</span>
                         )}
                     </div>
 

@@ -451,7 +451,7 @@ export default function SnsPage() {
         if (overviewStatsStatus === 'loading') {
             return '统计中...'
         }
-        return `共 ${overviewStats.totalPosts} 条 ｜ ${formatDateOnly(overviewStats.earliestTime)} ~ ${formatDateOnly(overviewStats.latestTime)} ｜ ${overviewStats.totalFriends} 位好友`
+        return `共 ${overviewStats.totalPosts} 条 ｜ ${formatDateOnly(overviewStats.earliestTime)} ~ ${formatDateOnly(overviewStats.latestTime)}`
     }
 
     const loadPosts = useCallback(async (options: { reset?: boolean, direction?: 'older' | 'newer' } = {}) => {
@@ -1112,6 +1112,13 @@ export default function SnsPage() {
                 setSearchKeyword={setSearchKeyword}
                 jumpTargetDate={jumpTargetDate}
                 setJumpTargetDate={setJumpTargetDate}
+                totalFriendsLabel={
+                    overviewStatsStatus === 'loading'
+                        ? '统计中'
+                        : overviewStatsStatus === 'ready'
+                            ? `${overviewStats.totalFriends} 位好友`
+                            : undefined
+                }
                 selectedUsernames={selectedUsernames}
                 setSelectedUsernames={setSelectedUsernames}
                 contacts={contacts}
