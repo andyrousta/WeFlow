@@ -53,7 +53,7 @@
   z-index: 12;
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  background: var(--bg-secondary);
+  background: var(--bg-secondary-solid, var(--bg-primary));
   display: flex;
   flex-direction: column;
   gap: 4px;

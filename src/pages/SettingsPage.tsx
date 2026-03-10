@@ -2098,7 +2098,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <div className="settings-header">
           <div className="settings-title-block">
             <h1>设置</h1>
-            <p>在这里集中调整 WeFlow 的功能、外观与数据行为。</p>
           </div>
           <div className="settings-actions">
             <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>
