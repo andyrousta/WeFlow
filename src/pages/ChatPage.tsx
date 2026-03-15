@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
+import { Search, MessageSquare, MessageSquareOff, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { useChatStore } from '../stores/chatStore'
@@ -33,6 +33,16 @@ const SYSTEM_MESSAGE_TYPES = [
   10000,        // 系统消息
   266287972401, // 拍一拍
 ]
+
+const EXITED_GROUP_SUMMARY_EXACT = '你已退出该群聊'
+
+function isExitedGroupSession(session: Pick<ChatSession, 'username' | 'lastMsgType' | 'summary'>): boolean {
+  return (
+    session.username.endsWith('@chatroom') &&
+    session.lastMsgType === 10000 &&
+    session.summary.trim() === EXITED_GROUP_SUMMARY_EXACT
+  )
+}
 
 interface XmlField {
   key: string;
@@ -512,6 +522,7 @@ function ChatPage(props: ChatPageProps) {
   const [groupMembersLoadingHint, setGroupMembersLoadingHint] = useState('')
   const [isRefreshingGroupMembers, setIsRefreshingGroupMembers] = useState(false)
   const [groupMemberSearchKeyword, setGroupMemberSearchKeyword] = useState('')
+  const [hideExitedGroups, setHideExitedGroups] = useState(true)
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
@@ -581,6 +592,25 @@ function ChatPage(props: ChatPageProps) {
 
 
   const highlightedMessageSet = useMemo(() => new Set(highlightedMessageKeys), [highlightedMessageKeys])
+  const exitedGroupCount = useMemo(() => {
+    if (!Array.isArray(sessions)) return 0
+    return sessions.filter(isExitedGroupSession).length
+  }, [sessions])
+  const sessionsAfterExitedGroupFilter = useMemo(() => {
+    if (!Array.isArray(sessions)) return []
+    if (!hideExitedGroups) return sessions
+    return sessions.filter((session) => !isExitedGroupSession(session))
+  }, [sessions, hideExitedGroups])
+  const exitedGroupFilterTitle = useMemo(() => {
+    if (hideExitedGroups) {
+      return exitedGroupCount > 0
+        ? `已隐藏 ${exitedGroupCount} 个已退出群聊，点击显示`
+        : '已开启：隐藏已退出群聊'
+    }
+    return exitedGroupCount > 0
+      ? `当前显示全部群聊（含 ${exitedGroupCount} 个已退出群聊），点击隐藏`
+      : '当前显示全部群聊，点击隐藏已退出群聊'
+  }, [exitedGroupCount, hideExitedGroups])
   const messageKeySetRef = useRef<Set<string>>(new Set())
   const lastMessageTimeRef = useRef(0)
   const sessionMapRef = useRef<Map<string, ChatSession>>(new Map())
@@ -2963,16 +2993,16 @@ function ChatPage(props: ChatPageProps) {
 
   // 普通视图：隐藏 isFolded 的群，保留 placeholder_foldgroup 入口
   useEffect(() => {
-    if (!Array.isArray(sessions)) {
+    if (!Array.isArray(sessionsAfterExitedGroupFilter)) {
       setFilteredSessions([])
       return
     }
 
     // 检查是否有折叠的群聊
-    const foldedGroups = sessions.filter(s => s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup'))
+    const foldedGroups = sessionsAfterExitedGroupFilter.filter(s => s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup'))
     const hasFoldedGroups = foldedGroups.length > 0
 
-    let visible = sessions.filter(s => {
+    let visible = sessionsAfterExitedGroupFilter.filter(s => {
       if (s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup')) return false
       return true
     })
@@ -3022,12 +3052,12 @@ function ChatPage(props: ChatPageProps) {
       s.username.toLowerCase().includes(lower) ||
       s.summary.toLowerCase().includes(lower)
     ))
-  }, [sessions, searchKeyword, setFilteredSessions])
+  }, [sessionsAfterExitedGroupFilter, searchKeyword, setFilteredSessions])
 
   // 折叠群列表（独立计算，供折叠 panel 使用）
   const foldedSessions = useMemo(() => {
-    if (!Array.isArray(sessions)) return []
-    const folded = sessions.filter(s => s.isFolded)
+    if (!Array.isArray(sessionsAfterExitedGroupFilter)) return []
+    const folded = sessionsAfterExitedGroupFilter.filter(s => s.isFolded)
     if (!searchKeyword.trim() || !foldedView) return folded
     const lower = searchKeyword.toLowerCase()
     return folded.filter(s =>
@@ -3035,7 +3065,7 @@ function ChatPage(props: ChatPageProps) {
       s.username.toLowerCase().includes(lower) ||
       s.summary.toLowerCase().includes(lower)
     )
-  }, [sessions, searchKeyword, foldedView])
+  }, [sessionsAfterExitedGroupFilter, searchKeyword, foldedView])
 
   const hasSessionRecords = Array.isArray(sessions) && sessions.length > 0
   const shouldShowSessionsSkeleton = isLoadingSessions && !hasSessionRecords
@@ -3878,6 +3908,15 @@ function ChatPage(props: ChatPageProps) {
           {/* 普通 header */}
           <div className="session-header-panel main-header">
             <div className="search-row">
+              <button
+                className={`icon-btn session-filter-btn ${hideExitedGroups ? 'active' : ''}`}
+                onClick={() => setHideExitedGroups((prev) => !prev)}
+                title={exitedGroupFilterTitle}
+                aria-label={hideExitedGroups ? '显示已退出群聊' : '隐藏已退出群聊'}
+                aria-pressed={hideExitedGroups}
+              >
+                <MessageSquareOff size={15} />
+              </button>
               <div className="search-box expanded">
                 <Search size={14} />
                 <input

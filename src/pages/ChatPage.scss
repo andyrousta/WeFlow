@@ -304,11 +304,12 @@
           }
         }
 
-        .refresh-btn {
+        .refresh-btn,
+        .session-filter-btn {
           width: 32px;
           height: 32px;
           padding: 0;
-          border: none;
+          border: 1px solid transparent;
           background: var(--bg-tertiary);
           border-radius: 8px;
           color: var(--text-secondary);
@@ -322,6 +323,12 @@
           &:hover {
             background: var(--bg-hover);
             color: var(--text-primary);
+          }
+
+          &.active {
+            background: var(--primary-light);
+            border-color: var(--primary-light);
+            color: var(--primary);
           }
 
           &:disabled {
@@ -812,7 +819,7 @@
   .icon-btn {
     width: 32px;
     height: 32px;
-    border: none;
+    border: 1px solid transparent;
     background: transparent;
     border-radius: 6px;
     cursor: pointer;
@@ -832,6 +839,20 @@
 
     .spin {
       animation: spin 1s linear infinite;
+    }
+  }
+
+  .session-filter-btn {
+    background: var(--bg-primary);
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    &.active {
+      background: var(--primary-light);
+      border-color: var(--primary-light);
+      color: var(--primary);
     }
   }
 
