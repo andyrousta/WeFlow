@@ -65,6 +65,8 @@ export const CONFIG_KEYS = {
   NOTIFICATION_FILTER_MODE: 'notificationFilterMode',
   NOTIFICATION_FILTER_LIST: 'notificationFilterList',
   HTTP_API_TOKEN: 'httpApiToken',
+  HTTP_API_ENABLED: 'httpApiEnabled',
+  HTTP_API_PORT: 'httpApiPort',
   MESSAGE_PUSH_ENABLED: 'messagePushEnabled',
   WINDOW_CLOSE_BEHAVIOR: 'windowCloseBehavior',
   QUOTE_LAYOUT: 'quoteLayout',
@@ -1483,4 +1485,27 @@ export async function getAnalyticsDenyCount(): Promise<number> {
 // 设置数据收集拒绝次数
 export async function setAnalyticsDenyCount(count: number): Promise<void> {
   await config.set(CONFIG_KEYS.ANALYTICS_DENY_COUNT, count)
+}
+
+
+// 获取 HTTP API 自动启动状态
+export async function getHttpApiEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.HTTP_API_ENABLED)
+  return value === true
+}
+
+// 设置 HTTP API 自动启动状态
+export async function setHttpApiEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.HTTP_API_ENABLED, enabled)
+}
+
+// 获取 HTTP API 端口
+export async function getHttpApiPort(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.HTTP_API_PORT)
+  return typeof value === 'number' ? value : 5031
+}
+
+// 设置 HTTP API 端口
+export async function setHttpApiPort(port: number): Promise<void> {
+  await config.set(CONFIG_KEYS.HTTP_API_PORT, port)
 }

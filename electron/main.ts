@@ -2825,6 +2825,8 @@ app.whenReady().then(async () => {
   // 启动时检测更新（不阻塞启动）
   checkForUpdatesOnStartup()
 
+  await httpService.autoStart()
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow()

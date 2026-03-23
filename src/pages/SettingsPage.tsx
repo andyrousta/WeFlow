@@ -130,6 +130,8 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     showMessage('已清除 Access Token，API 将允许无鉴权访问', true)
   }
 
+
+
   const [autoTranscribeVoice, setAutoTranscribeVoice] = useState(false)
   const [transcribeLanguages, setTranscribeLanguages] = useState<string[]>(['zh'])
 
@@ -344,6 +346,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedHttpApiToken = await configService.getHttpApiToken()
       if (savedHttpApiToken) setHttpApiToken(savedHttpApiToken)
 
+      const savedApiPort = await configService.getHttpApiPort()
+      if (savedApiPort) setHttpApiPort(savedApiPort)
+
       setAuthEnabled(savedAuthEnabled)
       setAuthUseHello(savedAuthUseHello)
       setIsLockMode(savedIsLockMode)
@@ -385,6 +390,8 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       const savedAnalyticsConsent = await configService.getAnalyticsConsent()
       setAnalyticsConsent(savedAnalyticsConsent ?? false)
+
+
 
       // 如果语言列表为空，保存默认值
       if (!savedTranscribeLanguages || savedTranscribeLanguages.length === 0) {
@@ -1850,6 +1857,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     try {
       await window.electronAPI.http.stop()
       setHttpApiRunning(false)
+      await configService.setHttpApiEnabled(false)
       showMessage('API 服务已停止', true)
     } catch (e: any) {
       showMessage(`操作失败: ${e}`, false)
@@ -1867,6 +1875,10 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       if (result.success) {
         setHttpApiRunning(true)
         if (result.port) setHttpApiPort(result.port)
+
+        await configService.setHttpApiEnabled(true)
+        await configService.setHttpApiPort(result.port || httpApiPort)
+
         showMessage(`API 服务已启动，端口 ${result.port}`, true)
       } else {
         showMessage(`启动失败: ${result.error}`, false)
@@ -1915,14 +1927,18 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <label>服务端口</label>
         <span className="form-hint">API 服务监听的端口号（1024-65535）</span>
         <input
-          type="number"
-          className="field-input"
-          value={httpApiPort}
-          onChange={(e) => setHttpApiPort(parseInt(e.target.value, 10) || 5031)}
-          disabled={httpApiRunning}
-          style={{ width: 120 }}
-          min={1024}
-          max={65535}
+            type="number"
+            className="field-input"
+            value={httpApiPort}
+            onChange={(e) => {
+              const port = parseInt(e.target.value, 10) || 5031
+              setHttpApiPort(port)
+              scheduleConfigSave('httpApiPort', () => configService.setHttpApiPort(port))
+            }}
+            disabled={httpApiRunning}
+            style={{ width: 120 }}
+            min={1024}
+            max={65535}
         />
       </div>
 

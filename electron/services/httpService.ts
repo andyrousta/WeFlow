@@ -246,6 +246,19 @@ class HttpService {
     }
   }
 
+  async autoStart(): Promise<void> {
+    const enabled = this.configService.get('httpApiEnabled')
+    if (enabled) {
+      const port = Number(this.configService.get('httpApiPort')) || 5031
+      try {
+        await this.start(port)
+        console.log(`[HttpService] Auto-started on port ${port}`)
+      } catch (err) {
+        console.error('[HttpService] Auto-start failed:', err)
+      }
+    }
+  }
+
     /**
      * 解析 POST 请求的 JSON Body
      */
@@ -282,9 +295,9 @@ class HttpService {
         if (queryToken && queryToken.trim() === expectedToken) return true
 
         const bodyToken = body['access_token']
-        if (bodyToken && String(bodyToken).trim() === expectedToken) return true
+        return !!(bodyToken && String(bodyToken).trim() === expectedToken);
 
-        return false
+
     }
 
     /**

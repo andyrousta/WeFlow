@@ -52,6 +52,8 @@ interface ConfigSchema {
   notificationFilterMode: 'all' | 'whitelist' | 'blacklist'
   notificationFilterList: string[]
   messagePushEnabled: boolean
+  httpApiEnabled: boolean
+  httpApiPort: number
   httpApiToken: string
   windowCloseBehavior: 'ask' | 'tray' | 'quit'
   quoteLayout: 'quote-top' | 'quote-bottom'
@@ -121,6 +123,8 @@ export class ConfigService {
       notificationFilterMode: 'all',
       notificationFilterList: [],
       httpApiToken: '',
+      httpApiEnabled: false,
+      httpApiPort: 5031,
       messagePushEnabled: false,
       windowCloseBehavior: 'ask',
       quoteLayout: 'quote-top',
@@ -664,11 +668,9 @@ export class ConfigService {
 
     // 即使 authEnabled 被删除/篡改，如果密钥是 lock: 格式，说明曾开启过应用锁
     const rawDecryptKey: any = this.store.get('decryptKey')
-    if (typeof rawDecryptKey === 'string' && rawDecryptKey.startsWith(LOCK_PREFIX)) {
-      return true
-    }
+    return typeof rawDecryptKey === 'string' && rawDecryptKey.startsWith(LOCK_PREFIX);
 
-    return false
+
   }
 
   // === 工具方法 ===
