@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useAppStore } from '../stores/appStore'
 import { useChatStore } from '../stores/chatStore'
 import { useThemeStore, themes } from '../stores/themeStore'
@@ -8,20 +9,19 @@ import * as configService from '../services/config'
 import {
   Eye, EyeOff, FolderSearch, FolderOpen, Search, Copy,
   RotateCcw, Trash2, Plug, Check, Sun, Moon, Monitor,
-  Palette, Database, Download, HardDrive, Info, RefreshCw, ChevronDown, Mic,
-  ShieldCheck, Fingerprint, Lock, KeyRound, Bell, Globe, BarChart2
+  Palette, Database, HardDrive, Info, RefreshCw, ChevronDown, Download, Mic,
+  ShieldCheck, Fingerprint, Lock, KeyRound, Bell, Globe, BarChart2, X, UserRound
 } from 'lucide-react'
 import { Avatar } from '../components/Avatar'
 import './SettingsPage.scss'
 
-type SettingsTab = 'appearance' | 'notification' | 'database' | 'models' | 'export' | 'cache' | 'api' | 'security' | 'about' | 'analytics'
+type SettingsTab = 'appearance' | 'notification' | 'database' | 'models' | 'cache' | 'api' | 'security' | 'about' | 'analytics'
 
 const tabs: { id: SettingsTab; label: string; icon: React.ElementType }[] = [
   { id: 'appearance', label: '外观', icon: Palette },
   { id: 'notification', label: '通知', icon: Bell },
   { id: 'database', label: '数据库连接', icon: Database },
   { id: 'models', label: '模型管理', icon: Mic },
-  { id: 'export', label: '导出', icon: Download },
   { id: 'cache', label: '缓存', icon: HardDrive },
   { id: 'api', label: 'API 服务', icon: Globe },
 
@@ -30,13 +30,30 @@ const tabs: { id: SettingsTab; label: string; icon: React.ElementType }[] = [
   { id: 'about', label: '关于', icon: Info }
 ]
 
+const isMac = navigator.userAgent.toLowerCase().includes('mac')
+const isLinux = navigator.userAgent.toLowerCase().includes('linux')
+
+const dbDirName = isMac ? '2.0b4.0.9 目录' : 'xwechat_files 目录'
+const dbPathPlaceholder = isMac
+    ? '例如: ~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9'
+    : isLinux
+        ? '例如: ~/.local/share/WeChat/xwechat_files 或者 ~/Documents/xwechat_files'
+        : '例如: C:\\Users\\xxx\\Documents\\xwechat_files'
+
 
 interface WxidOption {
   wxid: string
   modifiedTime: number
+  nickname?: string
+  avatarUrl?: string
 }
 
-function SettingsPage() {
+interface SettingsPageProps {
+  onClose?: () => void
+}
+
+function SettingsPage({ onClose }: SettingsPageProps = {}) {
+  const location = useLocation()
   const {
     isDbConnected,
     setDbConnected,
@@ -73,14 +90,6 @@ function SettingsPage() {
   const [wxid, setWxid] = useState('')
   const [wxidOptions, setWxidOptions] = useState<WxidOption[]>([])
   const [showWxidSelect, setShowWxidSelect] = useState(false)
-  const [showExportFormatSelect, setShowExportFormatSelect] = useState(false)
-  const [showExportDateRangeSelect, setShowExportDateRangeSelect] = useState(false)
-  const [showExportExcelColumnsSelect, setShowExportExcelColumnsSelect] = useState(false)
-  const [showExportConcurrencySelect, setShowExportConcurrencySelect] = useState(false)
-  const exportFormatDropdownRef = useRef<HTMLDivElement>(null)
-  const exportDateRangeDropdownRef = useRef<HTMLDivElement>(null)
-  const exportExcelColumnsDropdownRef = useRef<HTMLDivElement>(null)
-  const exportConcurrencyDropdownRef = useRef<HTMLDivElement>(null)
   const [cachePath, setCachePath] = useState('')
   const [imageKeyProgress, setImageKeyProgress] = useState(0)
   const [imageKeyPercent, setImageKeyPercent] = useState<number | null>(null)
@@ -103,23 +112,23 @@ function SettingsPage() {
 
   const [autoTranscribeVoice, setAutoTranscribeVoice] = useState(false)
   const [transcribeLanguages, setTranscribeLanguages] = useState<string[]>(['zh'])
-  const [exportDefaultFormat, setExportDefaultFormat] = useState('excel')
-  const [exportDefaultDateRange, setExportDefaultDateRange] = useState('today')
-  const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
-  const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
-  const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
-  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
 
   const [notificationEnabled, setNotificationEnabled] = useState(true)
-  const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'>('top-right')
+  const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'>('top-right')
   const [notificationFilterMode, setNotificationFilterMode] = useState<'all' | 'whitelist' | 'blacklist'>('all')
   const [notificationFilterList, setNotificationFilterList] = useState<string[]>([])
+  const [windowCloseBehavior, setWindowCloseBehavior] = useState<configService.WindowCloseBehavior>('ask')
+  const [quoteLayout, setQuoteLayout] = useState<configService.QuoteLayout>('quote-top')
   const [filterSearchKeyword, setFilterSearchKeyword] = useState('')
   const [filterModeDropdownOpen, setFilterModeDropdownOpen] = useState(false)
   const [positionDropdownOpen, setPositionDropdownOpen] = useState(false)
+  const [closeBehaviorDropdownOpen, setCloseBehaviorDropdownOpen] = useState(false)
 
   const [wordCloudExcludeWords, setWordCloudExcludeWords] = useState<string[]>([])
   const [excludeWordsInput, setExcludeWordsInput] = useState('')
+
+  // 数据收集同意状态
+  const [analyticsConsent, setAnalyticsConsent] = useState<boolean>(false)
 
 
 
@@ -140,6 +149,7 @@ function SettingsPage() {
   const [isClearingAnalyticsCache, setIsClearingAnalyticsCache] = useState(false)
   const [isClearingImageCache, setIsClearingImageCache] = useState(false)
   const [isClearingAllCache, setIsClearingAllCache] = useState(false)
+  const [isClosing, setIsClosing] = useState(false)
   const saveTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
 
   // 安全设置 state
@@ -162,8 +172,24 @@ function SettingsPage() {
   const [httpApiMediaExportPath, setHttpApiMediaExportPath] = useState('')
   const [isTogglingApi, setIsTogglingApi] = useState(false)
   const [showApiWarning, setShowApiWarning] = useState(false)
+  const [messagePushEnabled, setMessagePushEnabled] = useState(false)
 
   const isClearingCache = isClearingAnalyticsCache || isClearingImageCache || isClearingAllCache
+
+  const [isWayland, setIsWayland] = useState(false)
+  useEffect(() => {
+    const checkWaylandStatus = async () => {
+      if (window.electronAPI?.app?.checkWayland) {
+        try {
+          const wayland = await window.electronAPI.app.checkWayland()
+          setIsWayland(wayland)
+        } catch (e) {
+          console.error('检查 Wayland 状态失败:', e)
+        }
+      }
+    }
+    checkWaylandStatus()
+  }, [])
 
   // 检查 Hello 可用性
   useEffect(() => {
@@ -199,26 +225,22 @@ function SettingsPage() {
     }
   }, [])
 
-  // 点击外部关闭下拉框
   useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      const target = e.target as Node
-      if (showExportFormatSelect && exportFormatDropdownRef.current && !exportFormatDropdownRef.current.contains(target)) {
-        setShowExportFormatSelect(false)
-      }
-      if (showExportDateRangeSelect && exportDateRangeDropdownRef.current && !exportDateRangeDropdownRef.current.contains(target)) {
-        setShowExportDateRangeSelect(false)
-      }
-      if (showExportExcelColumnsSelect && exportExcelColumnsDropdownRef.current && !exportExcelColumnsDropdownRef.current.contains(target)) {
-        setShowExportExcelColumnsSelect(false)
-      }
-      if (showExportConcurrencySelect && exportConcurrencyDropdownRef.current && !exportConcurrencyDropdownRef.current.contains(target)) {
-        setShowExportConcurrencySelect(false)
+    const initialTab = (location.state as { initialTab?: SettingsTab } | null)?.initialTab
+    if (!initialTab) return
+    setActiveTab(initialTab)
+  }, [location.state])
+
+  useEffect(() => {
+    if (!onClose) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        handleClose()
       }
     }
-    document.addEventListener('mousedown', handleClickOutside)
-    return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [showExportFormatSelect, showExportDateRangeSelect, showExportExcelColumnsSelect, showExportConcurrencySelect])
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
 
   useEffect(() => {
     const removeDb = window.electronAPI.key.onDbKeyStatus((payload: { message: string; level: number }) => {
@@ -260,15 +282,16 @@ function SettingsPage() {
       if (!target.closest('.custom-select')) {
         setFilterModeDropdownOpen(false)
         setPositionDropdownOpen(false)
+        setCloseBehaviorDropdownOpen(false)
       }
     }
-    if (filterModeDropdownOpen || positionDropdownOpen) {
+    if (filterModeDropdownOpen || positionDropdownOpen || closeBehaviorDropdownOpen) {
       document.addEventListener('click', handleClickOutside)
     }
     return () => {
       document.removeEventListener('click', handleClickOutside)
     }
-  }, [filterModeDropdownOpen, positionDropdownOpen])
+  }, [closeBehaviorDropdownOpen, filterModeDropdownOpen, positionDropdownOpen])
 
 
   const loadConfig = async () => {
@@ -286,17 +309,13 @@ function SettingsPage() {
       const savedWhisperModelDir = await configService.getWhisperModelDir()
       const savedAutoTranscribe = await configService.getAutoTranscribeVoice()
       const savedTranscribeLanguages = await configService.getTranscribeLanguages()
-      const savedExportDefaultFormat = await configService.getExportDefaultFormat()
-      const savedExportDefaultDateRange = await configService.getExportDefaultDateRange()
-      const savedExportDefaultMedia = await configService.getExportDefaultMedia()
-      const savedExportDefaultVoiceAsText = await configService.getExportDefaultVoiceAsText()
-      const savedExportDefaultExcelCompactColumns = await configService.getExportDefaultExcelCompactColumns()
-      const savedExportDefaultConcurrency = await configService.getExportDefaultConcurrency()
-
       const savedNotificationEnabled = await configService.getNotificationEnabled()
       const savedNotificationPosition = await configService.getNotificationPosition()
       const savedNotificationFilterMode = await configService.getNotificationFilterMode()
       const savedNotificationFilterList = await configService.getNotificationFilterList()
+      const savedMessagePushEnabled = await configService.getMessagePushEnabled()
+      const savedWindowCloseBehavior = await configService.getWindowCloseBehavior()
+      const savedQuoteLayout = await configService.getQuoteLayout()
 
       const savedAuthEnabled = await window.electronAPI.auth.verifyEnabled()
       const savedAuthUseHello = await configService.getAuthUseHello()
@@ -327,21 +346,21 @@ function SettingsPage() {
       setLogEnabled(savedLogEnabled)
       setAutoTranscribeVoice(savedAutoTranscribe)
       setTranscribeLanguages(savedTranscribeLanguages)
-      setExportDefaultFormat(savedExportDefaultFormat || 'excel')
-      setExportDefaultDateRange(savedExportDefaultDateRange || 'today')
-      setExportDefaultMedia(savedExportDefaultMedia ?? false)
-      setExportDefaultVoiceAsText(savedExportDefaultVoiceAsText ?? false)
-      setExportDefaultExcelCompactColumns(savedExportDefaultExcelCompactColumns ?? true)
-      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 2)
 
       setNotificationEnabled(savedNotificationEnabled)
       setNotificationPosition(savedNotificationPosition)
       setNotificationFilterMode(savedNotificationFilterMode)
       setNotificationFilterList(savedNotificationFilterList)
+      setMessagePushEnabled(savedMessagePushEnabled)
+      setWindowCloseBehavior(savedWindowCloseBehavior)
+      setQuoteLayout(savedQuoteLayout)
 
       const savedExcludeWords = await configService.getWordCloudExcludeWords()
       setWordCloudExcludeWords(savedExcludeWords)
       setExcludeWordsInput(savedExcludeWords.join('\n'))
+
+      const savedAnalyticsConsent = await configService.getAnalyticsConsent()
+      setAnalyticsConsent(savedAnalyticsConsent ?? false)
 
       // 如果语言列表为空，保存默认值
       if (!savedTranscribeLanguages || savedTranscribeLanguages.length === 0) {
@@ -465,6 +484,14 @@ function SettingsPage() {
     setTimeout(() => setMessage(null), 3000)
   }
 
+  const handleClose = () => {
+    if (!onClose) return
+    setIsClosing(true)
+    setTimeout(() => {
+      onClose()
+    }, 200)
+  }
+
   type WxidKeys = {
     decryptKey: string
     imageXorKey: number | null
@@ -568,24 +595,37 @@ function SettingsPage() {
     }
   }
 
+  const validatePath = (path: string): string | null => {
+    if (!path) return null
+    if (/[\u4e00-\u9fa5]/.test(path)) {
+      return '路径包含中文字符，请迁移至全英文目录'
+    }
+    return null
+  }
+
   const handleAutoDetectPath = async () => {
     if (isDetectingPath) return
     setIsDetectingPath(true)
     try {
       const result = await window.electronAPI.dbPath.autoDetect()
       if (result.success && result.path) {
-        setDbPath(result.path)
-        await configService.setDbPath(result.path)
-        showMessage(`自动检测成功：${result.path}`, true)
+        const validationError = validatePath(result.path)
+        if (validationError) {
+          showMessage(validationError, false)
+        } else {
+          setDbPath(result.path)
+          await configService.setDbPath(result.path)
+          showMessage(`自动检测成功：${result.path}`, true)
 
-        const wxids = await window.electronAPI.dbPath.scanWxids(result.path)
-        setWxidOptions(wxids)
-        if (wxids.length === 1) {
-          await applyWxidSelection(wxids[0].wxid, {
-            toastText: `已检测到账号：${wxids[0].wxid}`
-          })
-        } else if (wxids.length > 1) {
-          setShowWxidSelect(true)
+          const wxids = await window.electronAPI.dbPath.scanWxids(result.path)
+          setWxidOptions(wxids)
+          if (wxids.length === 1) {
+            await applyWxidSelection(wxids[0].wxid, {
+              toastText: `已检测到账号：${wxids[0].wxid}`
+            })
+          } else if (wxids.length > 1) {
+            setShowWxidSelect(true)
+          }
         }
       } else {
         showMessage(result.error || '未能自动检测到数据库目录', false)
@@ -602,9 +642,14 @@ function SettingsPage() {
       const result = await dialog.openFile({ title: '选择微信数据库根目录', properties: ['openDirectory'] })
       if (!result.canceled && result.filePaths.length > 0) {
         const selectedPath = result.filePaths[0]
-        setDbPath(selectedPath)
-        await configService.setDbPath(selectedPath)
-        showMessage('已选择数据库目录', true)
+        const validationError = validatePath(selectedPath)
+        if (validationError) {
+          showMessage(validationError, false)
+        } else {
+          setDbPath(selectedPath)
+          await configService.setDbPath(selectedPath)
+          showMessage('已选择数据库目录', true)
+        }
       }
     } catch (e: any) {
       showMessage('选择目录失败', false)
@@ -768,47 +813,60 @@ function SettingsPage() {
 
   const handleAutoGetImageKey = async () => {
     if (isFetchingImageKey) return;
-    if (!dbPath) {
-      showMessage('请先选择数据库目录', false);
-      return;
-    }
+    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
     setIsFetchingImageKey(true);
     setImageKeyPercent(0)
     setImageKeyStatus('正在初始化...');
-    setImageKeyProgress(0); // 重置进度
+    setImageKeyProgress(0);
 
     try {
       const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
       const result = await window.electronAPI.key.autoGetImageKey(accountPath, wxid)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') {
-          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
-        }
+        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
         setImageAesKey(result.aesKey)
         setImageKeyStatus('已获取图片密钥')
         showMessage('已自动获取图片密钥', true)
-
-        // Auto-save after fetching keys
-        // We need to use the values directly because state updates are async
         const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
         const newAesKey = result.aesKey
-
         await configService.setImageXorKey(newXorKey)
         await configService.setImageAesKey(newAesKey)
-
-        if (wxid) {
-          await configService.setWxidConfig(wxid, {
-            decryptKey: decryptKey, // use current state as it hasn't changed here
-            imageXorKey: newXorKey,
-            imageAesKey: newAesKey
-          })
-        }
-
+        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
       } else {
         showMessage(result.error || '自动获取图片密钥失败', false)
       }
     } catch (e: any) {
       showMessage(`自动获取图片密钥失败: ${e}`, false)
+    } finally {
+      setIsFetchingImageKey(false)
+    }
+  }
+
+  const handleScanImageKeyFromMemory = async () => {
+    if (isFetchingImageKey) return;
+    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
+    setIsFetchingImageKey(true);
+    setImageKeyPercent(0)
+    setImageKeyStatus('正在扫描内存...');
+
+    try {
+      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
+      const result = await window.electronAPI.key.scanImageKeyFromMemory(accountPath)
+      if (result.success && result.aesKey) {
+        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        setImageAesKey(result.aesKey)
+        setImageKeyStatus('内存扫描成功，已获取图片密钥')
+        showMessage('内存扫描成功，已获取图片密钥', true)
+        const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
+        const newAesKey = result.aesKey
+        await configService.setImageXorKey(newXorKey)
+        await configService.setImageAesKey(newAesKey)
+        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+      } else {
+        showMessage(result.error || '内存扫描获取图片密钥失败', false)
+      }
+    } catch (e: any) {
+      showMessage(`内存扫描失败: ${e}`, false)
     } finally {
       setIsFetchingImageKey(false)
     }
@@ -895,6 +953,21 @@ function SettingsPage() {
     }
   }
 
+  const handleClearLog = async () => {
+    const confirmed = window.confirm('确定清空 wcdb.log 吗？')
+    if (!confirmed) return
+    try {
+      const result = await window.electronAPI.log.clear()
+      if (!result.success) {
+        showMessage(result.error || '清空日志失败', false)
+        return
+      }
+      showMessage('日志已清空', true)
+    } catch (e: any) {
+      showMessage(`清空日志失败: ${e}`, false)
+    }
+  }
+
   const handleClearAnalyticsCache = async () => {
     if (isClearingCache) return
     setIsClearingAnalyticsCache(true)
@@ -966,8 +1039,12 @@ function SettingsPage() {
           <div key={theme.id} className={`theme-card ${currentTheme === theme.id ? 'active' : ''}`} onClick={() => setTheme(theme.id)}>
             <div className="theme-preview" style={{
               background: effectiveMode === 'dark'
-                ? (theme.id === 'blossom-dream' ? 'linear-gradient(150deg, #151316 0%, #1A1620 50%, #131018 100%)' : 'linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%)')
-                : (theme.id === 'blossom-dream' ? `linear-gradient(150deg, ${theme.bgColor} 0%, #F8F2F8 45%, #F2F6FB 100%)` : `linear-gradient(135deg, ${theme.bgColor} 0%, ${theme.bgColor}dd 100%)`)
+                ? (theme.id === 'blossom-dream' ? 'linear-gradient(150deg, #151316 0%, #1A1620 50%, #131018 100%)'
+                  : theme.id === 'geist' ? 'linear-gradient(135deg, #1a1a1a 0%, #222222 100%)'
+                  : 'linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%)')
+                : (theme.id === 'blossom-dream' ? `linear-gradient(150deg, ${theme.bgColor} 0%, #F8F2F8 45%, #F2F6FB 100%)`
+                  : theme.id === 'geist' ? 'linear-gradient(135deg, #ffffff 0%, #f0f0f0 100%)'
+                  : `linear-gradient(135deg, ${theme.bgColor} 0%, ${theme.bgColor}dd 100%)`)
             }}>
               <div className="theme-accent" style={{
                 background: theme.accentColor
@@ -982,6 +1059,132 @@ function SettingsPage() {
             {currentTheme === theme.id && <div className="theme-check"><Check size={14} /></div>}
           </div>
         ))}
+      </div>
+
+      <div className="form-group">
+        <label>引用样式</label>
+        <span className="form-hint">选择聊天中引用消息与正文的上下顺序，右侧预览会同步展示布局差异。</span>
+        <div className="quote-layout-picker" role="radiogroup" aria-label="引用样式选择">
+          {[
+            {
+              value: 'quote-top' as const,
+              label: '引用在上',
+              description: '更接近当前 WeFlow 风格',
+              successMessage: '已切换为引用在上样式'
+            },
+            {
+              value: 'quote-bottom' as const,
+              label: '正文在上',
+              description: '更接近微信 / 密语风格',
+              successMessage: '已切换为正文在上样式'
+            }
+          ].map(option => {
+            const selected = quoteLayout === option.value
+            const quotePreview = (
+              <div className="quote-layout-preview-quote">
+                <span className="quote-layout-preview-sender">张三</span>
+                <span className="quote-layout-preview-text">这是一条被引用的消息</span>
+              </div>
+            )
+            const messagePreview = (
+              <div className="quote-layout-preview-message">这是当前发送的回复内容</div>
+            )
+
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className={`quote-layout-card ${selected ? 'active' : ''}`}
+                onClick={async () => {
+                  if (selected) return
+                  setQuoteLayout(option.value)
+                  await configService.setQuoteLayout(option.value)
+                  showMessage(option.successMessage, true)
+                }}
+                role="radio"
+                aria-checked={selected}
+              >
+                <div className="quote-layout-card-header">
+                  <div className="quote-layout-card-title-group">
+                    <span className="quote-layout-card-title">{option.label}</span>
+                    <span className="quote-layout-card-desc">{option.description}</span>
+                  </div>
+                  <span className={`quote-layout-card-check ${selected ? 'active' : ''}`}>
+                    <Check size={14} />
+                  </span>
+                </div>
+                <div className={`quote-layout-preview ${option.value}`}>
+                  {option.value === 'quote-bottom' ? (
+                    <>
+                      {messagePreview}
+                      {quotePreview}
+                    </>
+                  ) : (
+                    <>
+                      {quotePreview}
+                      {messagePreview}
+                    </>
+                  )}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>关闭主窗口时</label>
+        <span className="form-hint">设置点击关闭按钮后的默认行为；选择“每次询问”时会弹出关闭确认。</span>
+        <div className="custom-select">
+          <div
+            className={`custom-select-trigger ${closeBehaviorDropdownOpen ? 'open' : ''}`}
+            onClick={() => setCloseBehaviorDropdownOpen(!closeBehaviorDropdownOpen)}
+          >
+            <span className="custom-select-value">
+              {windowCloseBehavior === 'tray'
+                ? '最小化到系统托盘'
+                : windowCloseBehavior === 'quit'
+                  ? '完全关闭'
+                  : '每次询问'}
+            </span>
+            <ChevronDown size={14} className={`custom-select-arrow ${closeBehaviorDropdownOpen ? 'rotate' : ''}`} />
+          </div>
+          <div className={`custom-select-dropdown ${closeBehaviorDropdownOpen ? 'open' : ''}`}>
+            {[
+              {
+                value: 'ask' as const,
+                label: '每次询问',
+                successMessage: '已恢复关闭确认弹窗'
+              },
+              {
+                value: 'tray' as const,
+                label: '最小化到系统托盘',
+                successMessage: '关闭按钮已改为最小化到托盘'
+              },
+              {
+                value: 'quit' as const,
+                label: '完全关闭',
+                successMessage: '关闭按钮已改为完全关闭'
+              }
+            ].map(option => (
+              <div
+                key={option.value}
+                className={`custom-select-option ${windowCloseBehavior === option.value ? 'selected' : ''}`}
+                onClick={async () => {
+                  setWindowCloseBehavior(option.value)
+                  setCloseBehaviorDropdownOpen(false)
+                  await configService.setWindowCloseBehavior(option.value)
+                  showMessage(option.successMessage, true)
+                }}
+              >
+                {option.label}
+                {windowCloseBehavior === option.value && <Check size={14} />}
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -1055,6 +1258,11 @@ function SettingsPage() {
         <div className="form-group">
           <label>通知显示位置</label>
           <span className="form-hint">选择通知弹窗在屏幕上的显示位置</span>
+          {isWayland && (
+              <span className="form-hint" style={{ color: '#ff4d4f', marginTop: '4px', display: 'block' }}>
+              ⚠️ 注意：Wayland 环境下该配置可能无效！
+            </span>
+          )}
           <div className="custom-select">
             <div
               className={`custom-select-trigger ${positionDropdownOpen ? 'open' : ''}`}
@@ -1063,12 +1271,14 @@ function SettingsPage() {
               <span className="custom-select-value">
                 {notificationPosition === 'top-right' ? '右上角' :
                   notificationPosition === 'bottom-right' ? '右下角' :
-                    notificationPosition === 'top-left' ? '左上角' : '左下角'}
+                    notificationPosition === 'top-left' ? '左上角' :
+                      notificationPosition === 'top-center' ? '中间上方' : '左下角'}
               </span>
               <ChevronDown size={14} className={`custom-select-arrow ${positionDropdownOpen ? 'rotate' : ''}`} />
             </div>
             <div className={`custom-select-dropdown ${positionDropdownOpen ? 'open' : ''}`}>
               {[
+                { value: 'top-center', label: '中间上方' },
                 { value: 'top-right', label: '右上角' },
                 { value: 'bottom-right', label: '右下角' },
                 { value: 'top-left', label: '左上角' },
@@ -1078,7 +1288,7 @@ function SettingsPage() {
                   key={option.value}
                   className={`custom-select-option ${notificationPosition === option.value ? 'selected' : ''}`}
                   onClick={async () => {
-                    const val = option.value as 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'
+                    const val = option.value as 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'
                     setNotificationPosition(val)
                     setPositionDropdownOpen(false)
                     await configService.setNotificationPosition(val)
@@ -1266,10 +1476,9 @@ function SettingsPage() {
       <div className="form-group">
         <label>数据库根目录</label>
         <span className="form-hint">xwechat_files 目录</span>
-        <span className="form-hint" style={{ color: '#ff6b6b' }}> 目录路径不可包含中文，如有中文请去微信-设置-存储位置点击更改，迁移至全英文目录</span>
         <input
           type="text"
-          placeholder="例如: C:\Users\xxx\Documents\xwechat_files"
+          placeholder={dbPathPlaceholder}
           value={dbPath}
           onChange={(e) => {
             const value = e.target.value
@@ -1373,24 +1582,24 @@ function SettingsPage() {
             scheduleConfigSave('keys', () => syncCurrentKeys({ imageAesKey: value, wxid }))
           }}
         />
-        <button className="btn btn-secondary btn-sm" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey}>
-          <Plug size={14} /> {isFetchingImageKey ? '获取中...' : '自动获取图片密钥'}
-        </button>
+        <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+          <button className="btn btn-primary btn-sm" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey} title="从本地缓存快速计算">
+            <Plug size={14} /> {isFetchingImageKey ? '获取中...' : '缓存计算（推荐）'}
+          </button>
+          <button className="btn btn-secondary btn-sm" onClick={handleScanImageKeyFromMemory} disabled={isFetchingImageKey} title="扫描微信进程内存">
+            {isFetchingImageKey ? '扫描中...' : '内存扫描'}
+          </button>
+        </div>
         {isFetchingImageKey ? (
           <div className="brute-force-progress">
             <div className="status-header">
               <span className="status-text">{imageKeyStatus || '正在启动...'}</span>
-              {imageKeyPercent !== null && <span className="percent">{imageKeyPercent.toFixed(1)}%</span>}
             </div>
-            {imageKeyPercent !== null && (
-              <div className="progress-bar-container">
-                <div className="fill" style={{ width: `${imageKeyPercent}%` }}></div>
-              </div>
-            )}
           </div>
         ) : (
           imageKeyStatus && <div className="form-hint status-text" style={{ marginTop: '8px' }}>{imageKeyStatus}</div>
         )}
+        <span className="form-hint">优先推荐缓存计算方案。若图片无法解密，可使用内存扫描（需微信运行并打开 2-3 张图片大图）</span>
       </div>
 
       <div className="form-group">
@@ -1421,10 +1630,15 @@ function SettingsPage() {
           <button className="btn btn-secondary" onClick={handleCopyLog}>
             <Copy size={16} /> 复制日志内容
           </button>
+          <button className="btn btn-secondary" onClick={handleClearLog}>
+            <Trash2 size={16} /> 清空日志
+          </button>
         </div>
       </div>
     </div>
   )
+  const resolvedWhisperModelPath = whisperModelDir || whisperModelStatus?.modelPath || ''
+
   const renderModelsTab = () => (
     <div className="tab-content">
       <div className="form-group">
@@ -1439,42 +1653,52 @@ function SettingsPage() {
         <div className="setting-control vertical has-border">
           <div className="model-status-card">
             <div className="model-info">
-              <div className="model-name">SenseVoiceSmall (245 MB)</div>
-              <div className="model-path">
+              <div className="model-name-row">
+                <div className="model-name">SenseVoiceSmall</div>
+                <span className="model-size">245 MB</span>
+              </div>
+              <div className="model-meta">
                 {whisperModelStatus?.exists ? (
                   <span className="status-indicator success"><Check size={14} /> 已安装</span>
                 ) : (
                   <span className="status-indicator warning">未安装</span>
                 )}
-                {whisperModelDir && <div className="path-text" title={whisperModelDir}>{whisperModelDir}</div>}
+                {resolvedWhisperModelPath && (
+                  <div className="model-path-block">
+                    <span className="path-label">模型目录</span>
+                    <div className="path-text" title={resolvedWhisperModelPath}>{resolvedWhisperModelPath}</div>
+                  </div>
+                )}
               </div>
             </div>
-            <div className="model-actions">
-              {!whisperModelStatus?.exists && !isWhisperDownloading && (
-                <button
-                  className="btn-download"
-                  onClick={handleDownloadWhisperModel}
-                >
-                  <Download size={16} /> 下载模型
-                </button>
-              )}
-              {isWhisperDownloading && (
-                <div className="download-status">
-                  <div className="status-header">
-                    <span className="percent">{Math.round(whisperDownloadProgress)}%</span>
-                    {whisperProgressData.total > 0 && (
-                      <span className="details">
-                        {formatBytes(whisperProgressData.downloaded)} / {formatBytes(whisperProgressData.total)}
-                        <span className="speed">({formatBytes(whisperProgressData.speed)}/s)</span>
-                      </span>
-                    )}
+            {(!whisperModelStatus?.exists || isWhisperDownloading) && (
+              <div className="model-actions">
+                {!whisperModelStatus?.exists && !isWhisperDownloading && (
+                  <button
+                    className="btn-download"
+                    onClick={handleDownloadWhisperModel}
+                  >
+                    <Download size={16} /> 下载模型
+                  </button>
+                )}
+                {isWhisperDownloading && (
+                  <div className="download-status">
+                    <div className="status-header">
+                      <span className="percent">{Math.round(whisperDownloadProgress)}%</span>
+                      {whisperProgressData.total > 0 && (
+                        <span className="details">
+                          {formatBytes(whisperProgressData.downloaded)} / {formatBytes(whisperProgressData.total)}
+                          <span className="speed">({formatBytes(whisperProgressData.speed)}/s)</span>
+                        </span>
+                      )}
+                    </div>
+                    <div className="progress-bar-mini">
+                      <div className="fill" style={{ width: `${whisperDownloadProgress}%` }}></div>
+                    </div>
                   </div>
-                  <div className="progress-bar-mini">
-                    <div className="fill" style={{ width: `${whisperDownloadProgress}%` }}></div>
-                  </div>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="sub-setting">
@@ -1521,287 +1745,50 @@ function SettingsPage() {
     </div>
   )
 
-  const exportFormatOptions = [
-    { value: 'excel', label: 'Excel', desc: '电子表格，适合统计分析' },
-    { value: 'chatlab', label: 'ChatLab', desc: '标准格式，支持其他软件导入' },
-    { value: 'chatlab-jsonl', label: 'ChatLab JSONL', desc: '流式格式，适合大量消息' },
-    { value: 'json', label: 'JSON', desc: '详细格式，包含完整消息信息' },
-    { value: 'html', label: 'HTML', desc: '网页格式，可直接浏览' },
-    { value: 'txt', label: 'TXT', desc: '纯文本，通用格式' },
-    { value: 'weclone', label: 'WeClone CSV', desc: 'WeClone 兼容字段格式（CSV）' },
-    { value: 'sql', label: 'PostgreSQL', desc: '数据库脚本，便于导入到数据库' }
-  ]
-  const exportDateRangeOptions = [
-    { value: 'today', label: '今天' },
-    { value: '7d', label: '最近7天' },
-    { value: '30d', label: '最近30天' },
-    { value: '90d', label: '最近90天' },
-    { value: 'all', label: '全部时间' }
-  ]
-  const exportExcelColumnOptions = [
-    { value: 'compact', label: '精简列', desc: '序号、时间、发送者身份、消息类型、内容' },
-    { value: 'full', label: '完整列', desc: '含发送者昵称/微信ID/备注' }
-  ]
-
-  const exportConcurrencyOptions = [
-    { value: 1, label: '1' },
-    { value: 2, label: '2' },
-    { value: 3, label: '3' },
-    { value: 4, label: '4' },
-    { value: 5, label: '5' },
-    { value: 6, label: '6' }
-  ]
-
-  const getOptionLabel = (options: { value: string; label: string }[], value: string) => {
-    return options.find((option) => option.value === value)?.label ?? value
-  }
-
-  const renderExportTab = () => {
-    const exportExcelColumnsValue = exportDefaultExcelCompactColumns ? 'compact' : 'full'
-    const exportFormatLabel = getOptionLabel(exportFormatOptions, exportDefaultFormat)
-    const exportDateRangeLabel = getOptionLabel(exportDateRangeOptions, exportDefaultDateRange)
-    const exportExcelColumnsLabel = getOptionLabel(exportExcelColumnOptions, exportExcelColumnsValue)
-    const exportConcurrencyLabel = String(exportDefaultConcurrency)
-
-    return (
-      <div className="tab-content">
-        <div className="form-group">
-          <label>默认导出格式</label>
-          <span className="form-hint">导出页面默认选中的格式</span>
-          <div className="select-field" ref={exportFormatDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportFormatSelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportFormatSelect(!showExportFormatSelect)
-                setShowExportDateRangeSelect(false)
-                setShowExportExcelColumnsSelect(false)
-                setShowExportConcurrencySelect(false)
-              }}
-            >
-              <span className="select-value">{exportFormatLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportFormatSelect && (
-              <div className="select-dropdown">
-                {exportFormatOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportDefaultFormat === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      setExportDefaultFormat(option.value)
-                      await configService.setExportDefaultFormat(option.value)
-                      showMessage('已更新导出格式默认值', true)
-                      setShowExportFormatSelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                    {option.desc && <span className="option-desc">{option.desc}</span>}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label>默认导出时间范围</label>
-          <span className="form-hint">控制导出页面的默认时间选择</span>
-          <div className="select-field" ref={exportDateRangeDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportDateRangeSelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportDateRangeSelect(!showExportDateRangeSelect)
-                setShowExportFormatSelect(false)
-                setShowExportExcelColumnsSelect(false)
-                setShowExportConcurrencySelect(false)
-              }}
-            >
-              <span className="select-value">{exportDateRangeLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportDateRangeSelect && (
-              <div className="select-dropdown">
-                {exportDateRangeOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportDefaultDateRange === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      setExportDefaultDateRange(option.value)
-                      await configService.setExportDefaultDateRange(option.value)
-                      showMessage('已更新默认导出时间范围', true)
-                      setShowExportDateRangeSelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label>默认导出媒体文件</label>
-          <span className="form-hint">控制图片/语音/表情的默认导出开关</span>
-          <div className="log-toggle-line">
-            <span className="log-status">{exportDefaultMedia ? '已开启' : '已关闭'}</span>
-            <label className="switch" htmlFor="export-default-media">
-              <input
-                id="export-default-media"
-                className="switch-input"
-                type="checkbox"
-                checked={exportDefaultMedia}
-                onChange={async (e) => {
-                  const enabled = e.target.checked
-                  setExportDefaultMedia(enabled)
-                  await configService.setExportDefaultMedia(enabled)
-                  showMessage(enabled ? '已开启默认媒体导出' : '已关闭默认媒体导出', true)
-                }}
-              />
-              <span className="switch-slider" />
-            </label>
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label>默认语音转文字</label>
-          <span className="form-hint">导出时默认将语音转写为文字</span>
-          <div className="log-toggle-line">
-            <span className="log-status">{exportDefaultVoiceAsText ? '已开启' : '已关闭'}</span>
-            <label className="switch" htmlFor="export-default-voice-as-text">
-              <input
-                id="export-default-voice-as-text"
-                className="switch-input"
-                type="checkbox"
-                checked={exportDefaultVoiceAsText}
-                onChange={async (e) => {
-                  const enabled = e.target.checked
-                  setExportDefaultVoiceAsText(enabled)
-                  await configService.setExportDefaultVoiceAsText(enabled)
-                  showMessage(enabled ? '已开启默认语音转文字' : '已关闭默认语音转文字', true)
-                }}
-              />
-              <span className="switch-slider" />
-            </label>
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label>Excel 列显示</label>
-          <span className="form-hint">控制 Excel 导出的列字段</span>
-          <div className="select-field" ref={exportExcelColumnsDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportExcelColumnsSelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportExcelColumnsSelect(!showExportExcelColumnsSelect)
-                setShowExportFormatSelect(false)
-                setShowExportDateRangeSelect(false)
-                setShowExportConcurrencySelect(false)
-              }}
-            >
-              <span className="select-value">{exportExcelColumnsLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportExcelColumnsSelect && (
-              <div className="select-dropdown">
-                {exportExcelColumnOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportExcelColumnsValue === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      const compact = option.value === 'compact'
-                      setExportDefaultExcelCompactColumns(compact)
-                      await configService.setExportDefaultExcelCompactColumns(compact)
-                      showMessage(compact ? '已启用精简列' : '已启用完整列', true)
-                      setShowExportExcelColumnsSelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                    {option.desc && <span className="option-desc">{option.desc}</span>}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label>导出并发数</label>
-          <span className="form-hint">导出多个会话时的最大并发（1~6）</span>
-          <div className="select-field" ref={exportConcurrencyDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportConcurrencySelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportConcurrencySelect(!showExportConcurrencySelect)
-                setShowExportFormatSelect(false)
-                setShowExportDateRangeSelect(false)
-                setShowExportExcelColumnsSelect(false)
-              }}
-            >
-              <span className="select-value">{exportConcurrencyLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportConcurrencySelect && (
-              <div className="select-dropdown">
-                {exportConcurrencyOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportDefaultConcurrency === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      setExportDefaultConcurrency(option.value)
-                      await configService.setExportDefaultConcurrency(option.value)
-                      showMessage(`已将导出并发数设为 ${option.value}`, true)
-                      setShowExportConcurrencySelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-      </div>
-    )
-  }
   const renderCacheTab = () => (
-    <div className="tab-content">
-      <p className="section-desc">管理应用缓存数据</p>
-      <div className="form-group">
-        <label>缓存目录 <span className="optional">(可选)</span></label>
-        <span className="form-hint">留空使用默认目录</span>
-        <input
-          type="text"
-          placeholder="留空使用默认目录"
-          value={cachePath}
-          onChange={(e) => {
-            const value = e.target.value
-            setCachePath(value)
-            scheduleConfigSave('cachePath', () => configService.setCachePath(value))
-          }}
-        />
-        <div className="btn-row">
-          <button className="btn btn-secondary" onClick={handleSelectCachePath}><FolderOpen size={16} /> 浏览选择</button>
-          <button
-            className="btn btn-secondary"
-            onClick={async () => {
-              setCachePath('')
-              await configService.setCachePath('')
-            }}
-          >
-            <RotateCcw size={16} /> 恢复默认
-          </button>
+      <div className="tab-content">
+        <p className="section-desc">管理应用缓存数据</p>
+        <div className="form-group">
+          <label>缓存目录 <span className="optional">(可选)</span></label>
+          <span className="form-hint">留空使用默认目录</span>
+          <input
+              type="text"
+              placeholder="留空使用默认目录"
+              value={cachePath}
+              onChange={(e) => {
+                const value = e.target.value
+                setCachePath(value)
+                scheduleConfigSave('cachePath', () => configService.setCachePath(value))
+              }}
+          />
+
+          <div style={{ marginTop: '8px', fontSize: '13px', color: 'var(--text-secondary)' }}>
+            当前缓存位置：
+            <code style={{
+              background: 'var(--bg-secondary)',
+              padding: '3px 6px',
+              borderRadius: '4px',
+              userSelect: 'all',
+              wordBreak: 'break-all',
+              marginLeft: '4px'
+            }}>
+              {cachePath || (isMac ? '~/Documents/WeFlow' : isLinux ? '~/Documents/WeFlow' : '系统 文档\\WeFlow 目录')}
+            </code>
+          </div>
+
+          <div className="btn-row" style={{ marginTop: '12px' }}>
+            <button className="btn btn-secondary" onClick={handleSelectCachePath}><FolderOpen size={16} /> 浏览选择</button>
+            <button
+                className="btn btn-secondary"
+                onClick={async () => {
+                  setCachePath('')
+                  await configService.setCachePath('')
+                }}
+            >
+              <RotateCcw size={16} /> 恢复默认
+            </button>
+          </div>
         </div>
-      </div>
 
       <div className="btn-row">
         <button className="btn btn-secondary" onClick={handleClearAnalyticsCache} disabled={isClearingCache}>
@@ -1871,6 +1858,12 @@ function SettingsPage() {
     showMessage('已复制 API 地址', true)
   }
 
+  const handleToggleMessagePush = async (enabled: boolean) => {
+    setMessagePushEnabled(enabled)
+    await configService.setMessagePushEnabled(enabled)
+    showMessage(enabled ? '已开启主动推送' : '已关闭主动推送', true)
+  }
+
   const renderApiTab = () => (
     <div className="tab-content">
       <div className="form-group">
@@ -1935,6 +1928,70 @@ function SettingsPage() {
           value={httpApiMediaExportPath || '未获取到目录'}
           readOnly
         />
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>主动推送</label>
+        <span className="form-hint">检测到新收到的消息后，会通过当前 API 端口下的固定 SSE 地址主动推送给外部订阅端</span>
+        <div className="log-toggle-line">
+          <span className="log-status">
+            {messagePushEnabled ? '已开启' : '已关闭'}
+          </span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={messagePushEnabled}
+              onChange={(e) => { void handleToggleMessagePush(e.target.checked) }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>推送地址</label>
+        <span className="form-hint">外部软件连接这个 SSE 地址即可接收新消息推送；需要先开启上方 `HTTP API 服务`</span>
+        <div className="api-url-display">
+          <input
+            type="text"
+            className="field-input"
+            value={`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`}
+            readOnly
+          />
+          <button
+            className="btn btn-secondary"
+            onClick={() => {
+              navigator.clipboard.writeText(`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`)
+              showMessage('已复制推送地址', true)
+            }}
+            title="复制"
+          >
+            <Copy size={16} />
+          </button>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>推送内容</label>
+        <span className="form-hint">SSE 事件名为 `message.new`；私聊推送 `avatarUrl/sourceName/content`，群聊额外附带 `groupName`</span>
+        <div className="api-docs">
+          <div className="api-item">
+            <div className="api-endpoint">
+              <span className="method get">GET</span>
+              <code>{`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`}</code>
+            </div>
+            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重。</p>
+            <div className="api-params">
+              {['event', 'sessionId', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
+                <span key={param} className="param">
+                  <code>{param}</code>
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       {showApiWarning && (
@@ -2277,7 +2334,6 @@ function SettingsPage() {
                 <RefreshCw size={16} className={isCheckingUpdate ? 'spin' : ''} />
                 {isCheckingUpdate ? '检查中...' : '检查更新'}
               </button>
-
             </div>
           )}
         </div>
@@ -2293,72 +2349,113 @@ function SettingsPage() {
           <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.window.openAgreementWindow() }}>用户协议</a>
         </div>
         <p className="copyright">© 2025 WeFlow. All rights reserved.</p>
+
+        <div className="log-toggle-line" style={{ marginTop: '16px', justifyContent: 'center' }}>
+          <span style={{ fontSize: '13px', opacity: 0.7 }}>匿名数据收集</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              className="switch-input"
+              checked={analyticsConsent}
+              onChange={async (e) => {
+                const consent = e.target.checked
+                setAnalyticsConsent(consent)
+                await configService.setAnalyticsConsent(consent)
+                showMessage(consent ? '已允许数据收集' : '已拒绝数据收集', true)
+              }}
+            />
+            <span className="switch-slider"></span>
+          </label>
+        </div>
       </div>
     </div>
   )
 
   return (
-    <div className="settings-page">
-      {message && <div className={`message-toast ${message.success ? 'success' : 'error'}`}>{message.text}</div>}
+    <div className={`settings-modal-overlay ${isClosing ? 'closing' : ''}`} onClick={handleClose}>
+      <div className={`settings-page ${isClosing ? 'closing' : ''}`} onClick={(event) => event.stopPropagation()}>
+        {message && <div className={`message-toast ${message.success ? 'success' : 'error'}`}>{message.text}</div>}
 
-      {/* 多账号选择对话框 */}
-      {showWxidSelect && wxidOptions.length > 1 && (
-        <div className="wxid-dialog-overlay" onClick={() => setShowWxidSelect(false)}>
-          <div className="wxid-dialog" onClick={(e) => e.stopPropagation()}>
-            <div className="wxid-dialog-header">
-              <h3>检测到多个微信账号</h3>
-              <p>请选择要使用的账号</p>
-            </div>
-            <div className="wxid-dialog-list">
-              {wxidOptions.map((opt) => (
-                <div
-                  key={opt.wxid}
-                  className={`wxid-dialog-item ${opt.wxid === wxid ? 'active' : ''}`}
-                  onClick={() => handleSelectWxid(opt.wxid)}
-                >
-                  <span className="wxid-id">{opt.wxid}</span>
-                  <span className="wxid-date">最后修改 {new Date(opt.modifiedTime).toLocaleString()}</span>
-                </div>
-              ))}
-            </div>
-            <div className="wxid-dialog-footer">
-              <button className="btn btn-secondary" onClick={() => setShowWxidSelect(false)}>取消</button>
+        {/* 多账号选择对话框 */}
+        {showWxidSelect && wxidOptions.length > 1 && (
+          <div className="wxid-dialog-overlay" onClick={() => setShowWxidSelect(false)}>
+            <div className="wxid-dialog" onClick={(e) => e.stopPropagation()}>
+              <div className="wxid-dialog-header">
+                <h3>检测到多个微信账号</h3>
+                <p>请选择要使用的账号</p>
+              </div>
+              <div className="wxid-dialog-list">
+                {wxidOptions.map((opt) => (
+                    <div
+                        key={opt.wxid}
+                        className={`wxid-dialog-item ${opt.wxid === wxid ? 'active' : ''}`}
+                        onClick={() => handleSelectWxid(opt.wxid)}
+                    >
+                      <div className="wxid-profile-row">
+                        {opt.avatarUrl ? (
+                            <img src={opt.avatarUrl} alt="avatar" className="wxid-avatar" />
+                        ) : (
+                            <div className="wxid-avatar-fallback"><UserRound size={18}/></div>
+                        )}
+                        <div className="wxid-info-col">
+                          <span className="wxid-id">{opt.nickname || opt.wxid}</span>
+                          {opt.nickname && <span className="wxid-date">{opt.wxid}</span>}
+                        </div>
+                      </div>
+                      <span className="wxid-date" style={{marginLeft: 'auto'}}>最后修改 {new Date(opt.modifiedTime).toLocaleString()}</span>
+                    </div>
+                ))}
+              </div>
+              <div className="wxid-dialog-footer">
+                <button className="btn btn-secondary" onClick={() => setShowWxidSelect(false)}>取消</button>
+              </div>
             </div>
           </div>
+        )}
+
+        <div className="settings-header">
+          <div className="settings-title-block">
+            <h1>设置</h1>
+          </div>
+          <div className="settings-actions">
+            <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>
+              <Plug size={16} /> {isTesting ? '测试中...' : '测试连接'}
+            </button>
+            {onClose && (
+              <button type="button" className="settings-close-btn" onClick={handleClose} aria-label="关闭设置">
+                <X size={18} />
+              </button>
+            )}
+          </div>
         </div>
-      )}
 
-      <div className="settings-header">
-        <h1>设置</h1>
-        <div className="settings-actions">
-          <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>
-            <Plug size={16} /> {isTesting ? '测试中...' : '测试连接'}
-          </button>
+        <div className="settings-layout">
+          <div className="settings-tabs" role="tablist" aria-label="设置项">
+            {tabs.map(tab => (
+              <button
+                key={tab.id}
+                className={`tab-btn ${activeTab === tab.id ? 'active' : ''}`}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                <tab.icon size={16} />
+                <span>{tab.label}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="settings-body">
+            {activeTab === 'appearance' && renderAppearanceTab()}
+            {activeTab === 'notification' && renderNotificationTab()}
+            {activeTab === 'database' && renderDatabaseTab()}
+            {activeTab === 'models' && renderModelsTab()}
+            {activeTab === 'cache' && renderCacheTab()}
+            {activeTab === 'api' && renderApiTab()}
+            {activeTab === 'analytics' && renderAnalyticsTab()}
+            {activeTab === 'security' && renderSecurityTab()}
+            {activeTab === 'about' && renderAboutTab()}
+          </div>
         </div>
       </div>
-
-      <div className="settings-tabs">
-        {tabs.map(tab => (
-          <button key={tab.id} className={`tab-btn ${activeTab === tab.id ? 'active' : ''}`} onClick={() => setActiveTab(tab.id)}>
-            <tab.icon size={16} />
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </div>
-
-      <div className="settings-body">
-        {activeTab === 'appearance' && renderAppearanceTab()}
-        {activeTab === 'notification' && renderNotificationTab()}
-        {activeTab === 'database' && renderDatabaseTab()}
-        {activeTab === 'models' && renderModelsTab()}
-        {activeTab === 'export' && renderExportTab()}
-        {activeTab === 'cache' && renderCacheTab()}
-        {activeTab === 'api' && renderApiTab()}
-        {activeTab === 'analytics' && renderAnalyticsTab()}
-        {activeTab === 'security' && renderSecurityTab()}
-        {activeTab === 'about' && renderAboutTab()}
-      </div>
-
     </div>
   )
 }

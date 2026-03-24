@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
-export type ThemeId = 'cloud-dancer' | 'corundum-blue' | 'kiwi-green' | 'spicy-red' | 'teal-water' | 'blossom-dream'
+export type ThemeId = 'cloud-dancer' | 'corundum-blue' | 'kiwi-green' | 'spicy-red' | 'teal-water' | 'blossom-dream' | 'geist'
 export type ThemeMode = 'light' | 'dark' | 'system'
 
 export interface ThemeInfo {
@@ -57,6 +57,13 @@ export const themes: ThemeInfo[] = [
     description: 'RAL 180 80 10',
     primaryColor: '#5A8A8A',
     bgColor: '#E4F0F0'
+  },
+  {
+    id: 'geist',
+    name: 'Geist',
+    description: 'Vercel · 极简黑白',
+    primaryColor: '#000000',
+    bgColor: '#ffffff'
   }
 ]
 

@@ -12,6 +12,7 @@ type DbKeyResult = { success: boolean; key?: string; error?: string; logs?: stri
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; error?: string }
 
 export class KeyService {
+  private readonly isMac = process.platform === 'darwin'
   private koffi: any = null
   private lib: any = null
   private initialized = false
@@ -509,6 +510,58 @@ export class KeyService {
     return false
   }
 
+  private isLoginRelatedText(value: string): boolean {
+    const normalized = String(value || '').replace(/\s+/g, '').toLowerCase()
+    if (!normalized) return false
+    const keywords = [
+      '登录',
+      '扫码',
+      '二维码',
+      '请在手机上确认',
+      '手机确认',
+      '切换账号',
+      'wechatlogin',
+      'qrcode',
+      'scan'
+    ]
+    return keywords.some((keyword) => normalized.includes(keyword))
+  }
+
+  private async detectWeChatLoginRequired(pid: number): Promise<boolean> {
+    if (!this.ensureUser32()) return false
+    let loginRequired = false
+
+    const enumWindowsCallback = this.koffi.register((hWnd: any, _lParam: any) => {
+      if (!this.IsWindowVisible(hWnd)) return true
+      const title = this.getWindowTitle(hWnd)
+      if (!this.isWeChatWindowTitle(title)) return true
+
+      const pidBuf = Buffer.alloc(4)
+      this.GetWindowThreadProcessId(hWnd, pidBuf)
+      const windowPid = pidBuf.readUInt32LE(0)
+      if (windowPid !== pid) return true
+
+      if (this.isLoginRelatedText(title)) {
+        loginRequired = true
+        return false
+      }
+
+      const children = this.collectChildWindowInfos(hWnd)
+      for (const child of children) {
+        if (this.isLoginRelatedText(child.title) || this.isLoginRelatedText(child.className)) {
+          loginRequired = true
+          return false
+        }
+      }
+      return true
+    }, this.WNDENUMPROC_PTR)
+
+    this.EnumWindows(enumWindowsCallback, 0)
+    this.koffi.unregister(enumWindowsCallback)
+
+    return loginRequired
+  }
+
   private async waitForWeChatWindowComponents(pid: number, timeoutMs = 15000): Promise<boolean> {
     if (!this.ensureUser32()) return true
     const startTime = Date.now()
@@ -553,33 +606,13 @@ export class KeyService {
 
     const logs: string[] = []
 
-    onStatus?.('正在定位微信安装路径...', 0)
-    let wechatPath = await this.findWeChatInstallPath()
-    if (!wechatPath) {
-      const err = '未找到微信安装路径，请确认已安装PC微信'
+    onStatus?.('正在查找微信进程...', 0)
+    const pid = await this.findWeChatPid()
+    if (!pid) {
+      const err = '未找到微信进程，请先启动微信'
       onStatus?.(err, 2)
       return { success: false, error: err }
     }
-
-    onStatus?.('正在关闭微信以进行获取...', 0)
-    const closed = await this.killWeChatProcesses()
-    if (!closed) {
-      const err = '无法自动关闭微信，请手动退出后重试'
-      onStatus?.(err, 2)
-      return { success: false, error: err }
-    }
-
-    onStatus?.('正在启动微信...', 0)
-    const sub = spawn(wechatPath, {
-      detached: true,
-      stdio: 'ignore',
-      cwd: dirname(wechatPath)
-    })
-    sub.unref()
-
-    onStatus?.('等待微信界面就绪...', 0)
-    const pid = await this.waitForWeChatWindow()
-    if (!pid) return { success: false, error: '启动微信失败或等待界面就绪超时' }
 
     onStatus?.(`检测到微信窗口 (PID: ${pid})，正在获取...`, 0)
     onStatus?.('正在检测微信界面组件...', 0)
@@ -605,6 +638,7 @@ export class KeyService {
 
     const keyBuffer = Buffer.alloc(128)
     const start = Date.now()
+    let loginRequiredDetected = false
 
     try {
       while (Date.now() - start < timeoutMs) {
@@ -624,6 +658,9 @@ export class KeyService {
           const level = levelOut[0] ?? 0
           if (msg) {
             logs.push(msg)
+            if (this.isLoginRelatedText(msg)) {
+              loginRequiredDetected = true
+            }
             onStatus?.(msg, level)
           }
         }
@@ -633,6 +670,15 @@ export class KeyService {
       try {
         this.cleanupHook()
       } catch { }
+    }
+
+    const loginRequired = loginRequiredDetected || await this.detectWeChatLoginRequired(pid)
+    if (loginRequired) {
+      return {
+        success: false,
+        error: '微信已启动但尚未完成登录，请先在微信客户端完成登录后再重试自动获取密钥。',
+        logs
+      }
     }
 
     return { success: false, error: '获取密钥超时', logs }
@@ -647,6 +693,68 @@ export class KeyService {
     const second = wxid.indexOf('_', first + 1)
     if (second === -1) return wxid
     return wxid.substring(0, second)
+  }
+
+  private deriveImageKeys(code: number, wxid: string): { xorKey: number; aesKey: string } {
+    const cleanedWxid = this.cleanWxid(wxid)
+    const xorKey = code & 0xFF
+    const dataToHash = code.toString() + cleanedWxid
+    const md5Full = crypto.createHash('md5').update(dataToHash).digest('hex')
+    const aesKey = md5Full.substring(0, 16)
+    return { xorKey, aesKey }
+  }
+
+  private verifyDerivedAesKey(aesKey: string, ciphertext: Buffer): boolean {
+    try {
+      if (!aesKey || aesKey.length < 16 || ciphertext.length !== 16) return false
+      const decipher = crypto.createDecipheriv('aes-128-ecb', Buffer.from(aesKey, 'ascii').subarray(0, 16), null)
+      decipher.setAutoPadding(false)
+      const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+      if (dec[0] === 0xFF && dec[1] === 0xD8 && dec[2] === 0xFF) return true
+      if (dec[0] === 0x89 && dec[1] === 0x50 && dec[2] === 0x4E && dec[3] === 0x47) return true
+      if (dec[0] === 0x52 && dec[1] === 0x49 && dec[2] === 0x46 && dec[3] === 0x46) return true
+      if (dec[0] === 0x77 && dec[1] === 0x78 && dec[2] === 0x67 && dec[3] === 0x66) return true
+      if (dec[0] === 0x47 && dec[1] === 0x49 && dec[2] === 0x46) return true
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  private async collectWxidCandidates(manualDir?: string, wxidParam?: string): Promise<string[]> {
+    const candidates: string[] = []
+    const pushUnique = (value: string) => {
+      const v = String(value || '').trim()
+      if (!v || candidates.includes(v)) return
+      candidates.push(v)
+    }
+
+    if (wxidParam && wxidParam.startsWith('wxid_')) pushUnique(wxidParam)
+
+    if (manualDir) {
+      const normalized = manualDir.replace(/[\\/]+$/, '')
+      const dirName = normalized.split(/[\\/]/).pop() ?? ''
+      if (dirName.startsWith('wxid_')) pushUnique(dirName)
+
+      const marker = normalized.match(/[\\/]xwechat_files/i) || normalized.match(/[\\/]WeChat Files/i)
+      if (marker) {
+        const root = normalized.slice(0, marker.index! + marker[0].length)
+        try {
+          const { readdirSync, statSync } = await import('fs')
+          const { join } = await import('path')
+          for (const entry of readdirSync(root)) {
+            if (!entry.startsWith('wxid_')) continue
+            const full = join(root, entry)
+            try {
+              if (statSync(full).isDirectory()) pushUnique(entry)
+            } catch { }
+          }
+        } catch { }
+      }
+    }
+
+    pushUnique('unknown')
+    return candidates
   }
 
   async autoGetImageKey(
@@ -684,51 +792,295 @@ export class KeyService {
     const codes: number[] = accounts[0].keys.map((k: any) => k.code)
     console.log('[ImageKey] codes:', codes, 'DLL wxids:', accounts.map((a: any) => a.wxid))
 
-    // 优先级: 1. 直接传入的wxidParam 2. 从manualDir提取 3. DLL返回的wxid（可能是unknown）
-    let targetWxid = ''
-    
-    // 方案1: 直接使用传入的wxidParam（最优先）
-    if (wxidParam && wxidParam.startsWith('wxid_')) {
-      targetWxid = wxidParam
-      console.log('[ImageKey] 使用直接传入的 wxid:', targetWxid)
+    const wxidCandidates = await this.collectWxidCandidates(manualDir, wxidParam)
+    let verifyCiphertext: Buffer | null = null
+    if (manualDir && existsSync(manualDir)) {
+      const template = await this._findTemplateData(manualDir, 32)
+      verifyCiphertext = template.ciphertext
     }
-    
-    // 方案2: 从 manualDir 提取前端已配置好的正确 wxid
-    // 格式: "D:\weixin\xwechat_files\wxid_xxx_1234" → "wxid_xxx_1234"
-    if (!targetWxid && manualDir) {
-      const dirName = manualDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
-      if (dirName.startsWith('wxid_')) {
-        targetWxid = dirName
-        console.log('[ImageKey] 从 manualDir 提取 wxid:', targetWxid)
+
+    if (verifyCiphertext) {
+      onProgress?.(`正在校验候选 wxid（${wxidCandidates.length} 个）...`)
+      for (const candidateWxid of wxidCandidates) {
+        for (const code of codes) {
+          const { xorKey, aesKey } = this.deriveImageKeys(code, candidateWxid)
+          if (!this.verifyDerivedAesKey(aesKey, verifyCiphertext)) continue
+          onProgress?.(`密钥获取成功 (wxid: ${candidateWxid}, code: ${code})`)
+          console.log('[ImageKey] 校验命中: wxid=', candidateWxid, 'code=', code)
+          return { success: true, xorKey, aesKey }
+        }
       }
+      return { success: false, error: '缓存 code 与当前账号 wxid 未匹配，请确认账号目录后重试，或使用内存扫描' }
     }
 
-    // 方案3: 回退到 DLL 发现的第一个（可能是 unknown）
-    if (!targetWxid) {
-      targetWxid = accounts[0].wxid
-      console.log('[ImageKey] 无法获取 wxid，使用 DLL 发现的:', targetWxid)
+    // 无模板密文可验真时回退旧策略
+    const fallbackWxid = wxidCandidates[0] || accounts[0].wxid || 'unknown'
+    const fallbackCode = codes[0]
+    const { xorKey, aesKey } = this.deriveImageKeys(fallbackCode, fallbackWxid)
+    onProgress?.(`密钥获取成功 (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
+    console.log('[ImageKey] 回退计算: wxid=', fallbackWxid, 'code=', fallbackCode)
+    return { success: true, xorKey, aesKey }
+  }
+
+  // --- 内存扫描备选方案（融合 Dart+Python 优点）---
+  // 只扫 RW 可写区域（更快），同时支持 ASCII 和 UTF-16LE 两种密钥格式
+  // 验证支持 JPEG/PNG/WEBP/WXGF/GIF 多种格式
+
+  async autoGetImageKeyByMemoryScan(
+    userDir: string,
+    onProgress?: (message: string) => void
+  ): Promise<ImageKeyResult> {
+    if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
+
+    try {
+      // 1. 查找模板文件获取密文和 XOR 密钥
+      onProgress?.('正在查找模板文件...')
+      let result = await this._findTemplateData(userDir, 32)
+      let { ciphertext, xorKey } = result
+      
+      // 如果找不到密钥，尝试扫描更多文件
+      if (ciphertext && xorKey === null) {
+        onProgress?.('未找到有效密钥，尝试扫描更多文件...')
+        result = await this._findTemplateData(userDir, 100)
+        xorKey = result.xorKey
+      }
+      
+      if (!ciphertext) return { success: false, error: '未找到 V2 模板文件，请先在微信中查看几张图片' }
+      if (xorKey === null) return { success: false, error: '未能从模板文件中计算出有效的 XOR 密钥，请确保在微信中查看了多张不同的图片' }
+
+      onProgress?.(`XOR 密钥: 0x${xorKey.toString(16).padStart(2, '0')}，正在查找微信进程...`)
+
+      // 2. 找微信 PID
+      const pid = await this.findWeChatPid()
+      if (!pid) return { success: false, error: '微信进程未运行，请先启动微信' }
+
+      onProgress?.(`已找到微信进程 PID=${pid}，正在扫描内存...`)
+
+      // 3. 持续轮询内存扫描，最多 60 秒
+      const deadline = Date.now() + 60_000
+      let scanCount = 0
+      while (Date.now() < deadline) {
+        scanCount++
+        onProgress?.(`第 ${scanCount} 次扫描内存，请在微信中打开图片大图...`)
+        const aesKey = await this._scanMemoryForAesKey(pid, ciphertext, onProgress)
+        if (aesKey) {
+          onProgress?.('密钥获取成功')
+          return { success: true, xorKey, aesKey }
+        }
+        // 等 5 秒再试
+        await new Promise(r => setTimeout(r, 5000))
+      }
+
+      return {
+        success: false,
+        error: '60 秒内未找到 AES 密钥。\n请确保已在微信中打开 2-3 张图片大图后再试。'
+      }
+    } catch (e) {
+      return { success: false, error: `内存扫描失败: ${e}` }
+    }
+  }
+
+  private async _findTemplateData(userDir: string, limit: number = 32): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
+    const { readdirSync, readFileSync, statSync } = await import('fs')
+    const { join } = await import('path')
+    const V2_MAGIC = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
+
+    // 递归收集 *_t.dat 文件
+    const collect = (dir: string, results: string[], maxFiles: number) => {
+      if (results.length >= maxFiles) return
+      try {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (results.length >= maxFiles) break
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) collect(full, results, maxFiles)
+          else if (entry.isFile() && entry.name.endsWith('_t.dat')) results.push(full)
+        }
+      } catch { /* 忽略无权限目录 */ }
     }
 
-    // CleanWxid: 截断到第二个下划线，与 xkey 算法一致
-    const cleanedWxid = this.cleanWxid(targetWxid)
-    console.log('[ImageKey] wxid:', targetWxid, '→ cleaned:', cleanedWxid)
+    const files: string[] = []
+    collect(userDir, files, limit)
 
-    // 用 cleanedWxid + code 本地计算密钥
-    // xorKey = code & 0xFF
-    // aesKey = MD5(code.toString() + cleanedWxid).substring(0, 16)
-    const code = codes[0]
-    const xorKey = code & 0xFF
-    const dataToHash = code.toString() + cleanedWxid
-    const md5Full = crypto.createHash('md5').update(dataToHash).digest('hex')
-    const aesKey = md5Full.substring(0, 16)
+    // 按修改时间降序
+    files.sort((a, b) => {
+      try { return statSync(b).mtimeMs - statSync(a).mtimeMs } catch { return 0 }
+    })
 
-    onProgress?.(`密钥获取成功 (wxid: ${targetWxid}, code: ${code})`)
-    console.log('[ImageKey] 计算结果: xorKey=', xorKey, 'aesKey=', aesKey)
+    let ciphertext: Buffer | null = null
+    const tailCounts: Record<string, number> = {}
 
-    return {
-      success: true,
-      xorKey,
-      aesKey
+    for (const f of files.slice(0, 32)) {
+      try {
+        const data = readFileSync(f)
+        if (data.length < 8) continue
+
+        // 统计末尾两字节用于 XOR 密钥
+        if (data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 2) {
+          const key = `${data[data.length - 2]}_${data[data.length - 1]}`
+          tailCounts[key] = (tailCounts[key] ?? 0) + 1
+        }
+
+        // 提取密文（取第一个有效的）
+        if (!ciphertext && data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 0x1F) {
+          ciphertext = data.subarray(0xF, 0x1F)
+        }
+      } catch { /* 忽略 */ }
     }
+
+    // 计算 XOR 密钥
+    let xorKey: number | null = null
+    let maxCount = 0
+    for (const [key, count] of Object.entries(tailCounts)) {
+      if (count > maxCount) { maxCount = count; const [x, y] = key.split('_').map(Number); const k = x ^ 0xFF; if (k === (y ^ 0xD9)) xorKey = k }
+    }
+
+    return { ciphertext, xorKey }
+  }
+
+  private async _scanMemoryForAesKey(
+    pid: number,
+    ciphertext: Buffer,
+    onProgress?: (msg: string) => void
+  ): Promise<string | null> {
+    if (!this.ensureKernel32()) return null
+
+    // 直接用已加载的 kernel32 实例，用 uintptr 传地址
+    const VirtualQueryEx = this.kernel32.func('VirtualQueryEx', 'size_t', ['void*', 'uintptr', 'void*', 'size_t'])
+    const ReadProcessMemory = this.kernel32.func('ReadProcessMemory', 'bool', ['void*', 'uintptr', 'void*', 'size_t', this.koffi.out('size_t*')])
+
+    // RW 保护标志（只扫可写区域，速度更快）
+    const RW_FLAGS = 0x04 | 0x08 | 0x40 | 0x80 // PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    const MEM_COMMIT = 0x1000
+    const PAGE_NOACCESS = 0x01
+    const PAGE_GUARD = 0x100
+    const MBI_SIZE = 48 // MEMORY_BASIC_INFORMATION size on x64
+
+    const hProcess = this.OpenProcess(0x1F0FFF, false, pid)
+    if (!hProcess) return null
+
+    try {
+      // 枚举 RW 内存区域
+      const regions: Array<[number, number]> = []
+      let addr = 0
+      const mbi = Buffer.alloc(MBI_SIZE)
+
+      while (addr < 0x7FFFFFFFFFFF) {
+        const ret = VirtualQueryEx(hProcess, addr, mbi, MBI_SIZE)
+        if (ret === 0) break
+        // MEMORY_BASIC_INFORMATION x64 布局:
+        // 0:  BaseAddress (8)
+        // 8:  AllocationBase (8)
+        // 16: AllocationProtect (4) + 4 padding
+        // 24: RegionSize (8)
+        // 32: State (4)
+        // 36: Protect (4)
+        // 40: Type (4) + 4 padding = 48 total
+        const base = Number(mbi.readBigUInt64LE(0))
+        const size = Number(mbi.readBigUInt64LE(24))
+        const state = mbi.readUInt32LE(32)
+        const protect = mbi.readUInt32LE(36)
+
+        if (state === MEM_COMMIT &&
+            protect !== PAGE_NOACCESS &&
+            (protect & PAGE_GUARD) === 0 &&
+            (protect & RW_FLAGS) !== 0 &&
+            size <= 50 * 1024 * 1024) {
+          regions.push([base, size])
+        }
+        const next = base + size
+        if (next <= addr) break
+        addr = next
+      }
+
+      const totalMB = regions.reduce((s, [, sz]) => s + sz, 0) / 1024 / 1024
+      onProgress?.(`扫描 ${regions.length} 个 RW 区域 (${totalMB.toFixed(0)} MB)...`)
+
+      const CHUNK = 4 * 1024 * 1024
+      const OVERLAP = 65
+
+      for (let i = 0; i < regions.length; i++) {
+        const [base, size] = regions[i]
+        if (i % 20 === 0) {
+          onProgress?.(`扫描进度 ${i}/${regions.length}...`)
+          await new Promise(r => setTimeout(r, 1)) // 让出事件循环
+        }
+
+        let offset = 0
+        let trailing: Buffer | null = null
+
+        while (offset < size) {
+          const chunkSize = Math.min(CHUNK, size - offset)
+          const buf = Buffer.alloc(chunkSize)
+          const bytesReadOut = [0]
+          const ok = ReadProcessMemory(hProcess, base + offset, buf, chunkSize, bytesReadOut)
+          if (!ok || bytesReadOut[0] === 0) { offset += chunkSize; trailing = null; continue }
+
+          const data: Buffer = trailing ? Buffer.concat([trailing, buf.subarray(0, bytesReadOut[0])]) : buf.subarray(0, bytesReadOut[0])
+
+          // 搜索 ASCII 32字节密钥
+          const key = this._searchAsciiKey(data, ciphertext)
+          if (key) { this.CloseHandle(hProcess); return key }
+
+          // 搜索 UTF-16LE 32字节密钥
+          const key16 = this._searchUtf16Key(data, ciphertext)
+          if (key16) { this.CloseHandle(hProcess); return key16 }
+
+          trailing = data.subarray(Math.max(0, data.length - OVERLAP))
+          offset += chunkSize
+        }
+      }
+
+      return null
+    } finally {
+      this.CloseHandle(hProcess)
+    }
+  }
+
+  private _searchAsciiKey(data: Buffer, ciphertext: Buffer): string | null {
+    for (let i = 0; i < data.length - 34; i++) {
+      if (this._isAlphaNum(data[i])) continue
+      let valid = true
+      for (let j = 1; j <= 32; j++) {
+        if (!this._isAlphaNum(data[i + j])) { valid = false; break }
+      }
+      if (!valid) continue
+      if (i + 33 < data.length && this._isAlphaNum(data[i + 33])) continue
+      const keyBytes = data.subarray(i + 1, i + 33)
+      if (this._verifyAesKey(keyBytes, ciphertext)) return keyBytes.toString('ascii').substring(0, 16)
+    }
+    return null
+  }
+
+  private _searchUtf16Key(data: Buffer, ciphertext: Buffer): string | null {
+    for (let i = 0; i < data.length - 65; i++) {
+      let valid = true
+      for (let j = 0; j < 32; j++) {
+        if (data[i + j * 2 + 1] !== 0x00 || !this._isAlphaNum(data[i + j * 2])) { valid = false; break }
+      }
+      if (!valid) continue
+      const keyBytes = Buffer.alloc(32)
+      for (let j = 0; j < 32; j++) keyBytes[j] = data[i + j * 2]
+      if (this._verifyAesKey(keyBytes, ciphertext)) return keyBytes.toString('ascii').substring(0, 16)
+    }
+    return null
+  }
+
+  private _isAlphaNum(b: number): boolean {
+    return (b >= 0x61 && b <= 0x7A) || (b >= 0x41 && b <= 0x5A) || (b >= 0x30 && b <= 0x39)
+  }
+
+  private _verifyAesKey(keyBytes: Buffer, ciphertext: Buffer): boolean {
+    try {
+      const decipher = crypto.createDecipheriv('aes-128-ecb', keyBytes.subarray(0, 16), null)
+      decipher.setAutoPadding(false)
+      const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+      // 支持 JPEG / PNG / WEBP / WXGF / GIF
+      if (dec[0] === 0xFF && dec[1] === 0xD8 && dec[2] === 0xFF) return true
+      if (dec[0] === 0x89 && dec[1] === 0x50 && dec[2] === 0x4E && dec[3] === 0x47) return true
+      if (dec[0] === 0x52 && dec[1] === 0x49 && dec[2] === 0x46 && dec[3] === 0x46) return true
+      if (dec[0] === 0x77 && dec[1] === 0x78 && dec[2] === 0x67 && dec[3] === 0x66) return true
+      if (dec[0] === 0x47 && dec[1] === 0x49 && dec[2] === 0x46) return true
+      return false
+    } catch { return false }
   }
 }

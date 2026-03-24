@@ -3,7 +3,10 @@
   "version": "2.1.0",
   "description": "WeFlow",
   "main": "dist-electron/main.js",
-  "author": "cc",
+  "author": {
+    "name": "cc",
+    "email": "yccccccy@proton.me"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/hicccc77/WeFlow"
@@ -13,6 +16,7 @@
     "postinstall": "electron-builder install-app-deps",
     "rebuild": "electron-rebuild",
     "dev": "vite",
+    "typecheck": "tsc --noEmit",
     "build": "tsc && vite build && electron-builder",
     "preview": "vite preview",
     "electron:dev": "vite --mode electron",
@@ -20,7 +24,6 @@
     "preinstall": "node preinstall.js"
   },
   "dependencies": {
-    "better-sqlite3": "^12.5.0",
     "echarts": "^5.5.1",
     "echarts-for-react": "^3.0.2",
     "electron-store": "^10.0.0",
@@ -41,12 +44,12 @@
     "remark-gfm": "^4.0.1",
     "sherpa-onnx-node": "^1.10.38",
     "silk-wasm": "^3.7.1",
+    "sudo-prompt": "^9.2.1",
     "wechat-emojis": "^1.0.2",
     "zustand": "^5.0.2"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.2",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.3.4",
@@ -72,11 +75,34 @@
     "directories": {
       "output": "release"
     },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "electron/entitlements.mac.plist",
+      "entitlementsInherit": "electron/entitlements.mac.plist",
+      "icon": "resources/icon.icns"
+    },
     "win": {
       "target": [
         "nsis"
       ],
       "icon": "public/icon.ico"
+    },
+    "linux": {
+      "icon": "public/icon.png",
+      "target": [
+        "appimage",
+        "deb",
+        "tar.gz"
+      ],
+      "category": "Utility",
+      "executableName": "weflow",
+      "synopsis": "WeFlow for Linux"
     },
     "nsis": {
       "oneClick": false,
@@ -109,6 +135,10 @@
         "to": "icon.ico"
       },
       {
+        "from": "public/icon.png",
+        "to": "icon.png"
+      },
+      {
         "from": "electron/assets/wasm/",
         "to": "assets/wasm/"
       }
@@ -120,6 +150,8 @@
     "asarUnpack": [
       "node_modules/silk-wasm/**/*",
       "node_modules/sherpa-onnx-node/**/*",
+      "node_modules/sherpa-onnx-*/*",
+      "node_modules/sherpa-onnx-*/**/*",
       "node_modules/ffmpeg-static/**/*"
     ],
     "extraFiles": [
@@ -139,6 +171,7 @@
         "from": "resources/vcruntime140_1.dll",
         "to": "."
       }
-    ]
+    ],
+    "icon": "resources/icon.icns"
   }
 }

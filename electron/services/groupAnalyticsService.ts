@@ -21,6 +21,12 @@ export interface GroupMember {
   alias?: string
   remark?: string
   groupNickname?: string
+  isOwner?: boolean
+}
+
+export interface GroupMembersPanelEntry extends GroupMember {
+  isFriend: boolean
+  messageCount: number
 }
 
 export interface GroupMessageRank {
@@ -43,8 +49,34 @@ export interface GroupMediaStats {
   total: number
 }
 
+export interface GroupMemberMessagesPage {
+  messages: Message[]
+  hasMore: boolean
+  nextCursor: number
+}
+
+interface GroupMemberContactInfo {
+  remark: string
+  nickName: string
+  alias: string
+  username: string
+  userName: string
+  encryptUsername: string
+  encryptUserName: string
+  localType: number
+}
+
 class GroupAnalyticsService {
   private configService: ConfigService
+  private readonly groupMembersPanelCacheTtlMs = 10 * 60 * 1000
+  private readonly groupMembersPanelMembersTimeoutMs = 12 * 1000
+  private readonly groupMembersPanelFullTimeoutMs = 25 * 1000
+  private readonly groupMembersPanelCache = new Map<string, { updatedAt: number; data: GroupMembersPanelEntry[] }>()
+  private readonly groupMembersPanelInFlight = new Map<
+    string,
+    Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string; fromCache?: boolean; updatedAt?: number }>
+  >()
+  private readonly friendExcludeNames = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
 
   constructor() {
     this.configService = new ConfigService()
@@ -89,6 +121,127 @@ class GroupAnalyticsService {
     return cleaned
   }
 
+  private resolveMemberUsername(
+    candidate: unknown,
+    memberLookup: Map<string, string>
+  ): string | null {
+    if (typeof candidate !== 'string') return null
+    const raw = candidate.trim()
+    if (!raw) return null
+    if (memberLookup.has(raw)) return memberLookup.get(raw) || null
+    const cleaned = this.cleanAccountDirName(raw)
+    if (memberLookup.has(cleaned)) return memberLookup.get(cleaned) || null
+
+    const parts = raw.split(/[,\s;|]+/).filter(Boolean)
+    for (const part of parts) {
+      if (memberLookup.has(part)) return memberLookup.get(part) || null
+      const normalizedPart = this.cleanAccountDirName(part)
+      if (memberLookup.has(normalizedPart)) return memberLookup.get(normalizedPart) || null
+    }
+
+    if ((raw.startsWith('{') || raw.startsWith('[')) && raw.length < 4096) {
+      try {
+        const parsed = JSON.parse(raw)
+        return this.extractOwnerUsername(parsed, memberLookup, 0)
+      } catch {
+        return null
+      }
+    }
+
+    return null
+  }
+
+  private extractOwnerUsername(
+    value: unknown,
+    memberLookup: Map<string, string>,
+    depth: number
+  ): string | null {
+    if (depth > 4 || value == null) return null
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) return null
+
+    if (typeof value === 'string') {
+      return this.resolveMemberUsername(value, memberLookup)
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const owner = this.extractOwnerUsername(item, memberLookup, depth + 1)
+        if (owner) return owner
+      }
+      return null
+    }
+
+    if (typeof value !== 'object') return null
+    const row = value as Record<string, unknown>
+
+    for (const [key, entry] of Object.entries(row)) {
+      const keyLower = key.toLowerCase()
+      if (!keyLower.includes('owner') && !keyLower.includes('host') && !keyLower.includes('creator')) {
+        continue
+      }
+
+      if (typeof entry === 'boolean') {
+        if (entry && typeof row.username === 'string') {
+          const owner = this.resolveMemberUsername(row.username, memberLookup)
+          if (owner) return owner
+        }
+        continue
+      }
+
+      const owner = this.extractOwnerUsername(entry, memberLookup, depth + 1)
+      if (owner) return owner
+    }
+
+    return null
+  }
+
+  private async detectGroupOwnerUsername(
+    chatroomId: string,
+    members: Array<{ username: string; [key: string]: unknown }>
+  ): Promise<string | undefined> {
+    const memberLookup = new Map<string, string>()
+    for (const member of members) {
+      const username = String(member.username || '').trim()
+      if (!username) continue
+      const cleaned = this.cleanAccountDirName(username)
+      memberLookup.set(username, username)
+      memberLookup.set(cleaned, username)
+    }
+    if (memberLookup.size === 0) return undefined
+
+    const tryResolve = (candidate: unknown): string | undefined => {
+      const owner = this.extractOwnerUsername(candidate, memberLookup, 0)
+      return owner || undefined
+    }
+
+    for (const member of members) {
+      const owner = tryResolve(member)
+      if (owner) return owner
+    }
+
+    try {
+      const groupContact = await wcdbService.getContact(chatroomId)
+      if (groupContact.success && groupContact.contact) {
+        const owner = tryResolve(groupContact.contact)
+        if (owner) return owner
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      const roomExt = await wcdbService.getChatRoomExtBuffer(chatroomId)
+      if (roomExt.success && roomExt.extBuffer) {
+        const owner = tryResolve({ ext_buffer: roomExt.extBuffer })
+        if (owner) return owner
+      }
+    } catch {
+      // ignore
+    }
+
+    return undefined
+  }
+
   private async ensureConnected(): Promise<{ success: boolean; error?: string }> {
     const wxid = this.configService.get('myWxid')
     const dbPath = this.configService.get('dbPath')
@@ -107,20 +260,46 @@ class GroupAnalyticsService {
    * 从 DLL 获取群成员的群昵称
    */
   private async getGroupNicknamesForRoom(chatroomId: string, candidates: string[] = []): Promise<Map<string, string>> {
+    const nicknameMap = new Map<string, string>()
+
     try {
-      const escapedChatroomId = chatroomId.replace(/'/g, "''")
-      const sql = `SELECT ext_buffer FROM chat_room WHERE username='${escapedChatroomId}' LIMIT 1`
-      const result = await wcdbService.execQuery('contact', null, sql)
-      if (!result.success || !result.rows || result.rows.length === 0) {
-        return new Map<string, string>()
+      const dllResult = await wcdbService.getGroupNicknames(chatroomId)
+      if (dllResult.success && dllResult.nicknames) {
+        this.mergeGroupNicknameEntries(nicknameMap, Object.entries(dllResult.nicknames))
+      }
+    } catch (e) {
+      console.error('getGroupNicknamesForRoom dll error:', e)
+    }
+
+    try {
+      const result = await wcdbService.getChatRoomExtBuffer(chatroomId)
+      if (!result.success || !result.extBuffer) {
+        return nicknameMap
       }
 
-      const extBuffer = this.decodeExtBuffer((result.rows[0] as any).ext_buffer)
-      if (!extBuffer) return new Map<string, string>()
-      return this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates)
+      const extBuffer = this.decodeExtBuffer(result.extBuffer)
+      if (!extBuffer) return nicknameMap
+      this.mergeGroupNicknameEntries(nicknameMap, this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates).entries())
+      return nicknameMap
     } catch (e) {
       console.error('getGroupNicknamesForRoom error:', e)
-      return new Map<string, string>()
+      return nicknameMap
+    }
+  }
+
+  private mergeGroupNicknameEntries(
+    target: Map<string, string>,
+    entries: Iterable<[string, string]>
+  ): void {
+    for (const [memberIdRaw, nicknameRaw] of entries) {
+      const nickname = this.normalizeGroupNickname(nicknameRaw || '')
+      if (!nickname) continue
+      for (const alias of this.buildIdCandidates([memberIdRaw])) {
+        if (!alias) continue
+        if (!target.has(alias)) target.set(alias, nickname)
+        const lower = alias.toLowerCase()
+        if (!target.has(lower)) target.set(lower, nickname)
+      }
     }
   }
 
@@ -296,6 +475,193 @@ class GroupAnalyticsService {
     return Array.from(set)
   }
 
+  private toNonNegativeInteger(value: unknown): number {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return 0
+    return Math.max(0, Math.floor(parsed))
+  }
+
+  private pickStringField(row: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const value = row[key]
+      if (value == null) continue
+      const text = String(value).trim()
+      if (text) return text
+    }
+    return ''
+  }
+
+  private pickIntegerField(row: Record<string, unknown>, keys: string[], fallback: number = 0): number {
+    for (const key of keys) {
+      const value = row[key]
+      if (value == null || value === '') continue
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return Math.floor(parsed)
+    }
+    return fallback
+  }
+
+  private buildGroupMembersPanelCacheKey(chatroomId: string, includeMessageCounts: boolean): string {
+    const dbPath = String(this.configService.get('dbPath') || '').trim()
+    const wxid = this.cleanAccountDirName(String(this.configService.get('myWxid') || '').trim())
+    const mode = includeMessageCounts ? 'full' : 'members'
+    return `${dbPath}::${wxid}::${chatroomId}::${mode}`
+  }
+
+  private pruneGroupMembersPanelCache(maxEntries: number = 80): void {
+    if (this.groupMembersPanelCache.size <= maxEntries) return
+    const entries = Array.from(this.groupMembersPanelCache.entries())
+      .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+    const removeCount = this.groupMembersPanelCache.size - maxEntries
+    for (let i = 0; i < removeCount; i += 1) {
+      this.groupMembersPanelCache.delete(entries[i][0])
+    }
+  }
+
+  private async withPromiseTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    timeoutResult: T
+  ): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return promise
+    }
+
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null
+    const timeoutPromise = new Promise<T>((resolve) => {
+      timeoutTimer = setTimeout(() => {
+        resolve(timeoutResult)
+      }, timeoutMs)
+    })
+
+    try {
+      return await Promise.race([promise, timeoutPromise])
+    } finally {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer)
+      }
+    }
+  }
+
+  private async buildGroupMemberContactLookup(usernames: string[]): Promise<Map<string, GroupMemberContactInfo>> {
+    const lookup = new Map<string, GroupMemberContactInfo>()
+    const candidates = this.buildIdCandidates(usernames)
+    if (candidates.length === 0) return lookup
+
+    const appendContactsToLookup = (rows: Record<string, unknown>[]) => {
+      for (const row of rows) {
+        const contact: GroupMemberContactInfo = {
+          remark: this.pickStringField(row, ['remark', 'WCDB_CT_remark']),
+          nickName: this.pickStringField(row, ['nick_name', 'nickName', 'WCDB_CT_nick_name']),
+          alias: this.pickStringField(row, ['alias', 'WCDB_CT_alias']),
+          username: this.pickStringField(row, ['username', 'WCDB_CT_username']),
+          userName: this.pickStringField(row, ['user_name', 'userName', 'WCDB_CT_user_name']),
+          encryptUsername: this.pickStringField(row, ['encrypt_username', 'encryptUsername', 'WCDB_CT_encrypt_username']),
+          encryptUserName: this.pickStringField(row, ['encrypt_user_name', 'encryptUserName', 'WCDB_CT_encrypt_user_name']),
+          localType: this.pickIntegerField(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
+        }
+        const lookupKeys = this.buildIdCandidates([
+          contact.username,
+          contact.userName,
+          contact.encryptUsername,
+          contact.encryptUserName,
+          contact.alias
+        ])
+        for (const key of lookupKeys) {
+          const normalized = key.toLowerCase()
+          if (!lookup.has(normalized)) {
+            lookup.set(normalized, contact)
+          }
+        }
+      }
+    }
+
+    const batchSize = 200
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize)
+      if (batch.length === 0) continue
+
+      const result = await wcdbService.getContactsCompact(batch)
+      if (!result.success || !result.contacts) continue
+      appendContactsToLookup(result.contacts as Record<string, unknown>[])
+    }
+    return lookup
+  }
+
+  private resolveContactByCandidates(
+    lookup: Map<string, GroupMemberContactInfo>,
+    candidates: Array<string | undefined | null>
+  ): GroupMemberContactInfo | undefined {
+    const ids = this.buildIdCandidates(candidates)
+    for (const id of ids) {
+      const hit = lookup.get(id.toLowerCase())
+      if (hit) return hit
+    }
+    return undefined
+  }
+
+  private async buildGroupMessageCountLookup(chatroomId: string): Promise<Map<string, number>> {
+    const lookup = new Map<string, number>()
+    const result = await wcdbService.getGroupStats(chatroomId, 0, 0)
+    if (!result.success || !result.data) return lookup
+
+    const sessionData = result.data?.sessions?.[chatroomId]
+    if (!sessionData || !sessionData.senders) return lookup
+
+    const idMap = result.data.idMap || {}
+    for (const [senderId, rawCount] of Object.entries(sessionData.senders as Record<string, number>)) {
+      const username = String(idMap[senderId] || senderId || '').trim()
+      if (!username) continue
+      const count = this.toNonNegativeInteger(rawCount)
+      const keys = this.buildIdCandidates([username])
+      for (const key of keys) {
+        const normalized = key.toLowerCase()
+        const prev = lookup.get(normalized) || 0
+        if (count > prev) {
+          lookup.set(normalized, count)
+        }
+      }
+    }
+    return lookup
+  }
+
+  private resolveMessageCountByCandidates(
+    lookup: Map<string, number>,
+    candidates: Array<string | undefined | null>
+  ): number {
+    let maxCount = 0
+    const ids = this.buildIdCandidates(candidates)
+    for (const id of ids) {
+      const count = lookup.get(id.toLowerCase())
+      if (typeof count === 'number' && count > maxCount) {
+        maxCount = count
+      }
+    }
+    return maxCount
+  }
+
+  private isFriendMember(wxid: string, contact?: GroupMemberContactInfo): boolean {
+    const normalizedWxid = String(wxid || '').trim().toLowerCase()
+    if (!normalizedWxid) return false
+    if (normalizedWxid.includes('@chatroom') || normalizedWxid.startsWith('gh_')) return false
+    if (this.friendExcludeNames.has(normalizedWxid)) return false
+    if (!contact) return false
+    return contact.localType === 1
+  }
+
+  private sortGroupMembersPanelEntries(members: GroupMembersPanelEntry[]): GroupMembersPanelEntry[] {
+    return members.sort((a, b) => {
+      const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
+      if (ownerDiff !== 0) return ownerDiff
+
+      const friendDiff = Number(Boolean(b.isFriend)) - Number(Boolean(a.isFriend))
+      if (friendDiff !== 0) return friendDiff
+
+      if (a.messageCount !== b.messageCount) return b.messageCount - a.messageCount
+      return a.displayName.localeCompare(b.displayName, 'zh-Hans-CN')
+    })
+  }
+
   private resolveGroupNicknameByCandidates(groupNicknames: Map<string, string>, candidates: string[]): string {
     const idCandidates = this.buildIdCandidates(candidates)
     if (idCandidates.length === 0) return ''
@@ -396,34 +762,244 @@ class GroupAnalyticsService {
     return ''
   }
 
+  private normalizeCursorTimestamp(value: number): number {
+    if (!Number.isFinite(value) || value <= 0) return 0
+    const normalized = Math.floor(value)
+    return normalized > 10000000000 ? Math.floor(normalized / 1000) : normalized
+  }
+
+  private extractRowSenderUsername(row: Record<string, any>): string {
+    const candidates = [
+      row.sender_username,
+      row.senderUsername,
+      row.sender,
+      row.WCDB_CT_sender_username
+    ]
+    for (const candidate of candidates) {
+      const value = String(candidate || '').trim()
+      if (value) return value
+    }
+    for (const [key, value] of Object.entries(row)) {
+      const normalizedKey = key.toLowerCase()
+      if (
+        normalizedKey === 'sender_username' ||
+        normalizedKey === 'senderusername' ||
+        normalizedKey === 'sender' ||
+        normalizedKey === 'wcdb_ct_sender_username'
+      ) {
+        const normalizedValue = String(value || '').trim()
+        if (normalizedValue) return normalizedValue
+      }
+    }
+    return ''
+  }
+
+  private parseSingleMessageRow(row: Record<string, any>): Message | null {
+    try {
+      const mapped = chatService.mapRowsToMessagesForApi([row])
+      return Array.isArray(mapped) && mapped.length > 0 ? mapped[0] : null
+    } catch {
+      return null
+    }
+  }
+
+  private async openMemberMessageCursor(
+    chatroomId: string,
+    batchSize: number,
+    ascending: boolean,
+    startTime: number,
+    endTime: number
+  ): Promise<{ success: boolean; cursor?: number; error?: string }> {
+    const beginTimestamp = this.normalizeCursorTimestamp(startTime)
+    const endTimestamp = this.normalizeCursorTimestamp(endTime)
+    const liteResult = await wcdbService.openMessageCursorLite(chatroomId, batchSize, ascending, beginTimestamp, endTimestamp)
+    if (liteResult.success && liteResult.cursor) return liteResult
+    return wcdbService.openMessageCursor(chatroomId, batchSize, ascending, beginTimestamp, endTimestamp)
+  }
+
   private async collectMessagesByMember(
     chatroomId: string,
     memberUsername: string,
     startTime: number,
     endTime: number
   ): Promise<{ success: boolean; data?: Message[]; error?: string }> {
-    const batchSize = 500
+    const batchSize = 800
     const matchedMessages: Message[] = []
-    let offset = 0
+    const senderMatchCache = new Map<string, boolean>()
+    const matchesTargetSender = (sender: string | null | undefined): boolean => {
+      const key = String(sender || '').trim().toLowerCase()
+      if (!key) return false
+      const cached = senderMatchCache.get(key)
+      if (typeof cached === 'boolean') return cached
+      const matched = this.isSameAccountIdentity(memberUsername, sender)
+      senderMatchCache.set(key, matched)
+      return matched
+    }
 
-    while (true) {
-      const batch = await chatService.getMessages(chatroomId, offset, batchSize, startTime, endTime, true)
-      if (!batch.success || !batch.messages) {
-        return { success: false, error: batch.error || '获取群消息失败' }
-      }
+    const cursorResult = await this.openMemberMessageCursor(chatroomId, batchSize, true, startTime, endTime)
+    if (!cursorResult.success || !cursorResult.cursor) {
+      return { success: false, error: cursorResult.error || '创建群消息游标失败' }
+    }
 
-      for (const message of batch.messages) {
-        if (this.isSameAccountIdentity(memberUsername, message.senderUsername)) {
-          matchedMessages.push(message)
+    const cursor = cursorResult.cursor
+    try {
+      while (true) {
+        const batch = await wcdbService.fetchMessageBatch(cursor)
+        if (!batch.success) {
+          return { success: false, error: batch.error || '获取群消息失败' }
         }
-      }
+        const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+        if (rows.length === 0) break
 
-      const fetchedCount = batch.messages.length
-      if (fetchedCount <= 0 || !batch.hasMore) break
-      offset += fetchedCount
+        for (const row of rows) {
+          const senderFromRow = this.extractRowSenderUsername(row)
+          if (senderFromRow && !matchesTargetSender(senderFromRow)) {
+            continue
+          }
+          const message = this.parseSingleMessageRow(row)
+          if (!message) continue
+          if (matchesTargetSender(message.senderUsername)) {
+            matchedMessages.push(message)
+          }
+        }
+
+        if (!batch.hasMore) break
+      }
+    } finally {
+      await wcdbService.closeMessageCursor(cursor)
     }
 
     return { success: true, data: matchedMessages }
+  }
+
+  async getGroupMemberMessages(
+    chatroomId: string,
+    memberUsername: string,
+    options?: { startTime?: number; endTime?: number; limit?: number; cursor?: number }
+  ): Promise<{ success: boolean; data?: GroupMemberMessagesPage; error?: string }> {
+    try {
+      const conn = await this.ensureConnected()
+      if (!conn.success) return { success: false, error: conn.error }
+
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      const normalizedMemberUsername = String(memberUsername || '').trim()
+      if (!normalizedChatroomId) return { success: false, error: '群聊ID不能为空' }
+      if (!normalizedMemberUsername) return { success: false, error: '成员ID不能为空' }
+
+      const startTimeValue = Number.isFinite(options?.startTime) && typeof options?.startTime === 'number'
+        ? Math.max(0, Math.floor(options.startTime))
+        : 0
+      const endTimeValue = Number.isFinite(options?.endTime) && typeof options?.endTime === 'number'
+        ? Math.max(0, Math.floor(options.endTime))
+        : 0
+      const limit = Number.isFinite(options?.limit) && typeof options?.limit === 'number'
+        ? Math.max(1, Math.min(100, Math.floor(options.limit)))
+        : 50
+      let cursor = Number.isFinite(options?.cursor) && typeof options?.cursor === 'number'
+        ? Math.max(0, Math.floor(options.cursor))
+        : 0
+
+      const matchedMessages: Message[] = []
+      const senderMatchCache = new Map<string, boolean>()
+      const matchesTargetSender = (sender: string | null | undefined): boolean => {
+        const key = String(sender || '').trim().toLowerCase()
+        if (!key) return false
+        const cached = senderMatchCache.get(key)
+        if (typeof cached === 'boolean') return cached
+        const matched = this.isSameAccountIdentity(normalizedMemberUsername, sender)
+        senderMatchCache.set(key, matched)
+        return matched
+      }
+      const batchSize = Math.max(limit * 4, 240)
+      let hasMore = false
+
+      const cursorResult = await this.openMemberMessageCursor(
+        normalizedChatroomId,
+        batchSize,
+        false,
+        startTimeValue,
+        endTimeValue
+      )
+      if (!cursorResult.success || !cursorResult.cursor) {
+        return { success: false, error: cursorResult.error || '创建群成员消息游标失败' }
+      }
+
+      let consumedRows = 0
+      const dbCursor = cursorResult.cursor
+
+      try {
+        while (matchedMessages.length < limit) {
+          const batch = await wcdbService.fetchMessageBatch(dbCursor)
+          if (!batch.success) {
+            return { success: false, error: batch.error || '获取群成员消息失败' }
+          }
+
+          const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+          if (rows.length === 0) {
+            hasMore = false
+            break
+          }
+
+          let startIndex = 0
+          if (cursor > consumedRows) {
+            const skipCount = Math.min(cursor - consumedRows, rows.length)
+            consumedRows += skipCount
+            startIndex = skipCount
+            if (startIndex >= rows.length) {
+              if (!batch.hasMore) {
+                hasMore = false
+                break
+              }
+              continue
+            }
+          }
+
+          for (let index = startIndex; index < rows.length; index += 1) {
+            const row = rows[index]
+            consumedRows += 1
+
+            const senderFromRow = this.extractRowSenderUsername(row)
+            if (senderFromRow && !matchesTargetSender(senderFromRow)) {
+              continue
+            }
+
+            const message = this.parseSingleMessageRow(row)
+            if (!message) continue
+            if (!matchesTargetSender(message.senderUsername)) {
+              continue
+            }
+
+            matchedMessages.push(message)
+            if (matchedMessages.length >= limit) {
+              cursor = consumedRows
+              hasMore = index < rows.length - 1 || batch.hasMore === true
+              break
+            }
+          }
+
+          if (matchedMessages.length >= limit) break
+
+          cursor = consumedRows
+          if (!batch.hasMore) {
+            hasMore = false
+            break
+          }
+        }
+      } finally {
+        await wcdbService.closeMessageCursor(dbCursor)
+      }
+
+      return {
+        success: true,
+        data: {
+          messages: matchedMessages,
+          hasMore,
+          nextCursor: cursor
+        }
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
   }
 
   async getGroupChats(): Promise<{ success: boolean; data?: GroupChatInfo[]; error?: string }> {
@@ -483,6 +1059,167 @@ class GroupAnalyticsService {
     }
   }
 
+  private async loadGroupMembersPanelDataFresh(
+    chatroomId: string,
+    includeMessageCounts: boolean
+  ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string }> {
+    const membersResult = await wcdbService.getGroupMembers(chatroomId)
+    if (!membersResult.success || !membersResult.members) {
+      return { success: false, error: membersResult.error || '获取群成员失败' }
+    }
+
+    const members = membersResult.members as Array<{
+      username: string
+      avatarUrl?: string
+      originalName?: string
+      [key: string]: unknown
+    }>
+    if (members.length === 0) return { success: true, data: [] }
+
+    const usernames = members
+      .map((member) => String(member.username || '').trim())
+      .filter(Boolean)
+    if (usernames.length === 0) return { success: true, data: [] }
+
+    const displayNamesPromise = wcdbService.getDisplayNames(usernames)
+    const contactLookupPromise = this.buildGroupMemberContactLookup(usernames)
+    const ownerPromise = this.detectGroupOwnerUsername(chatroomId, members)
+    const messageCountLookupPromise = includeMessageCounts
+      ? this.buildGroupMessageCountLookup(chatroomId)
+      : Promise.resolve(new Map<string, number>())
+
+    const [displayNames, contactLookup, ownerUsername, messageCountLookup] = await Promise.all([
+      displayNamesPromise,
+      contactLookupPromise,
+      ownerPromise,
+      messageCountLookupPromise
+    ])
+
+    const nicknameCandidates = this.buildIdCandidates([
+      ...members.map((member) => member.username),
+      ...members.map((member) => member.originalName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.username),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.userName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUsername),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.alias)
+    ])
+    const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
+    const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
+    let myGroupMessageCountHint: number | undefined
+
+    const data: GroupMembersPanelEntry[] = members
+      .map((member) => {
+        const wxid = String(member.username || '').trim()
+        if (!wxid) return null
+
+        const contact = this.resolveContactByCandidates(contactLookup, [wxid, member.originalName])
+        const nickname = contact?.nickName || ''
+        const remark = contact?.remark || ''
+        const alias = contact?.alias || ''
+        const normalizedWxid = this.cleanAccountDirName(wxid)
+        const lookupCandidates = this.buildIdCandidates([
+          wxid,
+          member.originalName as string | undefined,
+          contact?.username,
+          contact?.userName,
+          contact?.encryptUsername,
+          contact?.encryptUserName,
+          alias
+        ])
+        if (normalizedWxid === myWxid) {
+          lookupCandidates.push(myWxid)
+        }
+        const groupNickname = this.resolveGroupNicknameByCandidates(groupNicknames, lookupCandidates)
+        const displayName = displayNames.success && displayNames.map ? (displayNames.map[wxid] || wxid) : wxid
+
+        return {
+          username: wxid,
+          displayName,
+          nickname,
+          alias,
+          remark,
+          groupNickname,
+          avatarUrl: member.avatarUrl,
+          isOwner: Boolean(ownerUsername && ownerUsername === wxid),
+          isFriend: this.isFriendMember(wxid, contact),
+          messageCount: this.resolveMessageCountByCandidates(messageCountLookup, lookupCandidates)
+        }
+      })
+      .filter((member): member is GroupMembersPanelEntry => Boolean(member))
+
+    if (includeMessageCounts && myWxid) {
+      const selfEntry = data.find((member) => this.cleanAccountDirName(member.username) === myWxid)
+      if (selfEntry && Number.isFinite(selfEntry.messageCount)) {
+        myGroupMessageCountHint = Math.max(0, Math.floor(selfEntry.messageCount))
+      }
+    }
+
+    if (includeMessageCounts && Number.isFinite(myGroupMessageCountHint)) {
+      void chatService.setGroupMyMessageCountHint(chatroomId, myGroupMessageCountHint as number)
+    }
+
+    return { success: true, data: this.sortGroupMembersPanelEntries(data) }
+  }
+
+  async getGroupMembersPanelData(
+    chatroomId: string,
+    options?: { forceRefresh?: boolean; includeMessageCounts?: boolean }
+  ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string; fromCache?: boolean; updatedAt?: number }> {
+    try {
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      if (!normalizedChatroomId) return { success: false, error: '群聊ID不能为空' }
+
+      const forceRefresh = Boolean(options?.forceRefresh)
+      const includeMessageCounts = options?.includeMessageCounts !== false
+      const cacheKey = this.buildGroupMembersPanelCacheKey(normalizedChatroomId, includeMessageCounts)
+      const now = Date.now()
+      const cached = this.groupMembersPanelCache.get(cacheKey)
+      if (!forceRefresh && cached && now - cached.updatedAt < this.groupMembersPanelCacheTtlMs) {
+        return { success: true, data: cached.data, fromCache: true, updatedAt: cached.updatedAt }
+      }
+
+      if (!forceRefresh) {
+        const pending = this.groupMembersPanelInFlight.get(cacheKey)
+        if (pending) return pending
+      }
+
+      const requestPromise = (async () => {
+        const conn = await this.ensureConnected()
+        if (!conn.success) return { success: false, error: conn.error }
+
+        const timeoutMs = includeMessageCounts
+          ? this.groupMembersPanelFullTimeoutMs
+          : this.groupMembersPanelMembersTimeoutMs
+        const fresh = await this.withPromiseTimeout(
+          this.loadGroupMembersPanelDataFresh(normalizedChatroomId, includeMessageCounts),
+          timeoutMs,
+          {
+            success: false,
+            error: includeMessageCounts
+              ? '群成员发言统计加载超时，请稍后重试'
+              : '群成员列表加载超时，请稍后重试'
+          }
+        )
+        if (!fresh.success || !fresh.data) {
+          return { success: false, error: fresh.error || '获取群成员面板数据失败' }
+        }
+
+        const updatedAt = Date.now()
+        this.groupMembersPanelCache.set(cacheKey, { updatedAt, data: fresh.data })
+        this.pruneGroupMembersPanelCache()
+        return { success: true, data: fresh.data, fromCache: false, updatedAt }
+      })().finally(() => {
+        this.groupMembersPanelInFlight.delete(cacheKey)
+      })
+
+      this.groupMembersPanelInFlight.set(cacheKey, requestPromise)
+      return await requestPromise
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
   async getGroupMembers(chatroomId: string): Promise<{ success: boolean; data?: GroupMember[]; error?: string }> {
     try {
       const conn = await this.ensureConnected()
@@ -497,6 +1234,7 @@ class GroupAnalyticsService {
         username: string
         avatarUrl?: string
         originalName?: string
+        [key: string]: unknown
       }>
       const usernames = members.map((m) => m.username).filter(Boolean)
 
@@ -543,6 +1281,7 @@ class GroupAnalyticsService {
       const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
 
       const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
+      const ownerUsername = await this.detectGroupOwnerUsername(chatroomId, members)
       const data: GroupMember[] = members.map((m) => {
         const wxid = m.username || ''
         const displayName = displayNames.success && displayNames.map ? (displayNames.map[wxid] || wxid) : wxid
@@ -572,7 +1311,8 @@ class GroupAnalyticsService {
           alias,
           remark,
           groupNickname,
-          avatarUrl: m.avatarUrl
+          avatarUrl: m.avatarUrl,
+          isOwner: Boolean(ownerUsername && ownerUsername === wxid)
         }
       })
 

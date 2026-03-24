@@ -6,8 +6,9 @@ import './NotificationWindow.scss'
 export default function NotificationWindow() {
     const [notification, setNotification] = useState<NotificationData | null>(null)
     const [prevNotification, setPrevNotification] = useState<NotificationData | null>(null)
+    const [position, setPosition] = useState<string>('top-right')
 
-    // We need a ref to access the current notification inside the callback 
+    // We need a ref to access the current notification inside the callback
     // without satisfying the dependency array which would recreate the listener
     // Actually, setNotification(prev => ...) pattern is better, but we need the VALUE of current to set as prev.
     // So we use setNotification callback: setNotification(current => { ... return newNode })
@@ -32,6 +33,11 @@ export default function NotificationWindow() {
                 content: data.content,
                 timestamp: timestamp,
                 avatarUrl: data.avatarUrl
+            }
+
+            // 获取位置配置
+            if (data.position) {
+                setPosition(data.position)
             }
 
             // Set previous to current (ref)
@@ -117,6 +123,7 @@ export default function NotificationWindow() {
                 <div
                     id="notification-prev"
                     key={prevNotification.id}
+                    className={position === 'top-center' ? 'anim-center' : ''}
                     style={{
                         position: 'absolute',
                         top: 2, // Match padding
@@ -131,7 +138,7 @@ export default function NotificationWindow() {
                         data={prevNotification}
                         onClose={() => { }} // No-op for background item
                         onClick={() => { }}
-                        position="top-right"
+                        position={position as any}
                         isStatic={true}
                         initialVisible={true}
                     />
@@ -143,6 +150,7 @@ export default function NotificationWindow() {
                 <div
                     id="notification-current"
                     key={notification.id}
+                    className={position === 'top-center' ? 'anim-center' : ''}
                     style={{
                         position: 'relative', // Takes up space
                         zIndex: 2,
@@ -154,7 +162,7 @@ export default function NotificationWindow() {
                         data={notification}
                         onClose={handleClose}
                         onClick={handleClick}
-                        position="top-right"
+                        position={position as any}
                         isStatic={true}
                         initialVisible={true}
                     />

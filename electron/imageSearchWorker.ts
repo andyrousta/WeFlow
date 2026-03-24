@@ -10,7 +10,7 @@ type WorkerPayload = {
   thumbOnly: boolean
 }
 
-type Candidate = { score: number; path: string; isThumb: boolean; hasX: boolean }
+type Candidate = { score: number; path: string; isThumb: boolean }
 
 const payload = workerData as WorkerPayload
 
@@ -18,16 +18,26 @@ function looksLikeMd5(value: string): boolean {
   return /^[a-fA-F0-9]{16,32}$/.test(value)
 }
 
+function stripDatVariantSuffix(base: string): string {
+  const lower = base.toLowerCase()
+  const suffixes = ['_thumb', '.thumb', '_hd', '.hd', '_h', '.h', '_t', '.t', '_c', '.c']
+  for (const suffix of suffixes) {
+    if (lower.endsWith(suffix)) {
+      return lower.slice(0, -suffix.length)
+    }
+  }
+  if (/[._][a-z]$/.test(lower)) {
+    return lower.slice(0, -2)
+  }
+  return lower
+}
+
 function hasXVariant(baseLower: string): boolean {
-  return /[._][a-z]$/.test(baseLower)
+  return stripDatVariantSuffix(baseLower) !== baseLower
 }
 
 function hasImageVariantSuffix(baseLower: string): boolean {
-  return /[._][a-z]$/.test(baseLower)
-}
-
-function isLikelyImageDatBase(baseLower: string): boolean {
-  return hasImageVariantSuffix(baseLower) || looksLikeMd5(baseLower)
+  return stripDatVariantSuffix(baseLower) !== baseLower
 }
 
 function normalizeDatBase(name: string): string {
@@ -35,10 +45,17 @@ function normalizeDatBase(name: string): string {
   if (base.endsWith('.dat') || base.endsWith('.jpg')) {
     base = base.slice(0, -4)
   }
-  while (/[._][a-z]$/.test(base)) {
-    base = base.slice(0, -2)
+  while (true) {
+    const stripped = stripDatVariantSuffix(base)
+    if (stripped === base) {
+      return base
+    }
+    base = stripped
   }
-  return base
+}
+
+function isLikelyImageDatBase(baseLower: string): boolean {
+  return hasImageVariantSuffix(baseLower) || looksLikeMd5(normalizeDatBase(baseLower))
 }
 
 function matchesDatName(fileName: string, datName: string): boolean {
@@ -47,25 +64,23 @@ function matchesDatName(fileName: string, datName: string): boolean {
   const normalizedBase = normalizeDatBase(base)
   const normalizedTarget = normalizeDatBase(datName.toLowerCase())
   if (normalizedBase === normalizedTarget) return true
-  const pattern = new RegExp(`^${datName}(?:[._][a-z])?\\.dat$`)
-  if (pattern.test(lower)) return true
-  return lower.endsWith('.dat') && lower.includes(datName)
+  return lower.endsWith('.dat') && lower.includes(normalizedTarget)
 }
 
 function scoreDatName(fileName: string): number {
-  if (fileName.includes('.t.dat') || fileName.includes('_t.dat')) return 1
-  if (fileName.includes('.c.dat') || fileName.includes('_c.dat')) return 1
-  return 2
+  const lower = fileName.toLowerCase()
+  const baseLower = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
+  if (baseLower.endsWith('_h') || baseLower.endsWith('.h')) return 600
+  if (!hasXVariant(baseLower)) return 500
+  if (baseLower.endsWith('_hd') || baseLower.endsWith('.hd')) return 450
+  if (baseLower.endsWith('_c') || baseLower.endsWith('.c')) return 400
+  if (isThumbnailDat(lower)) return 100
+  return 350
 }
 
 function isThumbnailDat(fileName: string): boolean {
-  return fileName.includes('.t.dat') || fileName.includes('_t.dat')
-}
-
-function isHdDat(fileName: string): boolean {
   const lower = fileName.toLowerCase()
-  const base = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
-  return base.endsWith('_hd') || base.endsWith('_h')
+  return lower.includes('.t.dat') || lower.includes('_t.dat') || lower.includes('_thumb.dat')
 }
 
 function walkForDat(
@@ -105,20 +120,15 @@ function walkForDat(
       if (!lower.endsWith('.dat')) continue
       const baseLower = lower.slice(0, -4)
       if (!isLikelyImageDatBase(baseLower)) continue
-      if (!hasXVariant(baseLower)) continue
       if (!matchesDatName(lower, datName)) continue
-      // 排除高清图片格式 (_hd, _h)
-      if (isHdDat(lower)) continue
       matchedBases.add(baseLower)
       const isThumb = isThumbnailDat(lower)
       if (!allowThumbnail && isThumb) continue
       if (thumbOnly && !isThumb) continue
-      const score = scoreDatName(lower)
       candidates.push({
-        score,
+        score: scoreDatName(lower),
         path: entryPath,
-        isThumb,
-        hasX: hasXVariant(baseLower)
+        isThumb
       })
     }
   }
@@ -126,10 +136,8 @@ function walkForDat(
     return { path: null, matchedBases: Array.from(matchedBases).slice(0, 20) }
   }
 
-  const withX = candidates.filter((item) => item.hasX)
-  const basePool = withX.length ? withX : candidates
-  const nonThumb = basePool.filter((item) => !item.isThumb)
-  const finalPool = thumbOnly ? basePool : (nonThumb.length ? nonThumb : basePool)
+  const nonThumb = candidates.filter((item) => !item.isThumb)
+  const finalPool = thumbOnly ? candidates : (nonThumb.length ? nonThumb : candidates)
 
   let best: { score: number; path: string } | null = null
   for (const item of finalPool) {

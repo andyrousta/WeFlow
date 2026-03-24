@@ -20,20 +20,25 @@ if (parentPort) {
                     result = { success: true }
                     break
                 case 'setMonitor':
-                    core.setMonitor((type, json) => {
+                    {
+                    const monitorOk = core.setMonitor((type, json) => {
                         parentPort!.postMessage({
                             id: -1,
                             type: 'monitor',
                             payload: { type, json }
                         })
                     })
-                    result = { success: true }
+                    result = { success: monitorOk }
                     break
+                    }
                 case 'testConnection':
                     result = await core.testConnection(payload.dbPath, payload.hexKey, payload.wxid)
                     break
                 case 'open':
                     result = await core.open(payload.dbPath, payload.hexKey, payload.wxid)
+                    break
+                case 'getLastInitError':
+                    result = core.getLastInitError()
                     break
                 case 'close':
                     core.close()
@@ -53,6 +58,27 @@ if (parentPort) {
                     break
                 case 'getMessageCount':
                     result = await core.getMessageCount(payload.sessionId)
+                    break
+                case 'getMessageCounts':
+                    result = await core.getMessageCounts(payload.sessionIds)
+                    break
+                case 'getSessionMessageCounts':
+                    result = await core.getSessionMessageCounts(payload.sessionIds)
+                    break
+                case 'getSessionMessageTypeStats':
+                    result = await core.getSessionMessageTypeStats(payload.sessionId, payload.beginTimestamp, payload.endTimestamp)
+                    break
+                case 'getSessionMessageTypeStatsBatch':
+                    result = await core.getSessionMessageTypeStatsBatch(payload.sessionIds, payload.options)
+                    break
+                case 'getSessionMessageDateCounts':
+                    result = await core.getSessionMessageDateCounts(payload.sessionId)
+                    break
+                case 'getSessionMessageDateCountsBatch':
+                    result = await core.getSessionMessageDateCountsBatch(payload.sessionIds)
+                    break
+                case 'getMessagesByType':
+                    result = await core.getMessagesByType(payload.sessionId, payload.localType, payload.ascending, payload.limit, payload.offset)
                     break
                 case 'getDisplayNames':
                     result = await core.getDisplayNames(payload.usernames)
@@ -84,11 +110,32 @@ if (parentPort) {
                 case 'getMessageMeta':
                     result = await core.getMessageMeta(payload.dbPath, payload.tableName, payload.limit, payload.offset)
                     break
+                case 'getMessageTableColumns':
+                    result = await core.getMessageTableColumns(payload.dbPath, payload.tableName)
+                    break
+                case 'getMessageTableTimeRange':
+                    result = await core.getMessageTableTimeRange(payload.dbPath, payload.tableName)
+                    break
                 case 'getContact':
                     result = await core.getContact(payload.username)
                     break
                 case 'getContactStatus':
                     result = await core.getContactStatus(payload.usernames)
+                    break
+                case 'getContactTypeCounts':
+                    result = await core.getContactTypeCounts()
+                    break
+                case 'getContactsCompact':
+                    result = await core.getContactsCompact(payload.usernames)
+                    break
+                case 'getContactAliasMap':
+                    result = await core.getContactAliasMap(payload.usernames)
+                    break
+                case 'getContactFriendFlags':
+                    result = await core.getContactFriendFlags(payload.usernames)
+                    break
+                case 'getChatRoomExtBuffer':
+                    result = await core.getChatRoomExtBuffer(payload.chatroomId)
                     break
                 case 'getAggregateStats':
                     result = await core.getAggregateStats(payload.sessionIds, payload.beginTimestamp, payload.endTimestamp)
@@ -126,6 +173,12 @@ if (parentPort) {
                 case 'getEmoticonCdnUrl':
                     result = await core.getEmoticonCdnUrl(payload.dbPath, payload.md5)
                     break
+                case 'getEmoticonCaption':
+                    result = await core.getEmoticonCaption(payload.dbPath, payload.md5)
+                    break
+                case 'getEmoticonCaptionStrict':
+                    result = await core.getEmoticonCaptionStrict(payload.md5)
+                    break
                 case 'listMessageDbs':
                     result = await core.listMessageDbs()
                     break
@@ -135,17 +188,47 @@ if (parentPort) {
                 case 'getMessageById':
                     result = await core.getMessageById(payload.sessionId, payload.localId)
                     break
+                case 'searchMessages':
+                    result = await core.searchMessages(payload.keyword, payload.sessionId, payload.limit, payload.offset, payload.beginTimestamp, payload.endTimestamp)
+                    break
                 case 'getVoiceData':
                     result = await core.getVoiceData(payload.sessionId, payload.createTime, payload.candidates, payload.localId, payload.svrId)
                     if (!result.success) {
                         console.error('[wcdbWorker] getVoiceData failed:', result.error)
                     }
                     break
+                case 'getVoiceDataBatch':
+                    result = await core.getVoiceDataBatch(payload.requests)
+                    break
+                case 'getMediaSchemaSummary':
+                    result = await core.getMediaSchemaSummary(payload.dbPath)
+                    break
+                case 'getHeadImageBuffers':
+                    result = await core.getHeadImageBuffers(payload.usernames)
+                    break
+                case 'resolveImageHardlink':
+                    result = await core.resolveImageHardlink(payload.md5, payload.accountDir)
+                    break
+                case 'resolveImageHardlinkBatch':
+                    result = await core.resolveImageHardlinkBatch(payload.requests)
+                    break
+                case 'resolveVideoHardlinkMd5':
+                    result = await core.resolveVideoHardlinkMd5(payload.md5, payload.dbPath)
+                    break
+                case 'resolveVideoHardlinkMd5Batch':
+                    result = await core.resolveVideoHardlinkMd5Batch(payload.requests)
+                    break
                 case 'getSnsTimeline':
                     result = await core.getSnsTimeline(payload.limit, payload.offset, payload.usernames, payload.keyword, payload.startTime, payload.endTime)
                     break
                 case 'getSnsAnnualStats':
                     result = await core.getSnsAnnualStats(payload.beginTimestamp, payload.endTimestamp)
+                    break
+                case 'getSnsUsernames':
+                    result = await core.getSnsUsernames()
+                    break
+                case 'getSnsExportStats':
+                    result = await core.getSnsExportStats(payload.myWxid)
                     break
                 case 'installSnsBlockDeleteTrigger':
                     result = await core.installSnsBlockDeleteTrigger()
@@ -171,7 +254,15 @@ if (parentPort) {
                 case 'deleteMessage':
                     result = await core.deleteMessage(payload.sessionId, payload.localId, payload.createTime, payload.dbPathHint)
                     break
-
+                case 'cloudInit':
+                    result = await core.cloudInit(payload.intervalSeconds)
+                    break
+                case 'cloudReport':
+                    result = await core.cloudReport(payload.statsJson)
+                    break
+                case 'cloudStop':
+                    result = core.cloudStop()
+                    break
                 default:
                     result = { success: false, error: `Unknown method: ${type}` }
             }

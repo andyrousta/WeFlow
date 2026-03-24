@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Routes, Route, useNavigate, useLocation } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { Routes, Route, Navigate, useNavigate, useLocation, type Location } from 'react-router-dom'
 import TitleBar from './components/TitleBar'
 import Sidebar from './components/Sidebar'
 import RouteGuard from './components/RouteGuard'
@@ -8,6 +8,7 @@ import HomePage from './pages/HomePage'
 import ChatPage from './pages/ChatPage'
 import AnalyticsPage from './pages/AnalyticsPage'
 import AnalyticsWelcomePage from './pages/AnalyticsWelcomePage'
+import ChatAnalyticsHubPage from './pages/ChatAnalyticsHubPage'
 import AnnualReportPage from './pages/AnnualReportPage'
 import AnnualReportWindow from './pages/AnnualReportWindow'
 import DualReportPage from './pages/DualReportPage'
@@ -26,6 +27,7 @@ import NotificationWindow from './pages/NotificationWindow'
 import { useAppStore } from './stores/appStore'
 import { themes, useThemeStore, type ThemeId, type ThemeMode } from './stores/themeStore'
 import * as configService from './services/config'
+import * as cloudControl from './services/cloudControl'
 import { Download, X, Shield } from 'lucide-react'
 import './App.scss'
 
@@ -35,10 +37,24 @@ import LockScreen from './components/LockScreen'
 import { GlobalSessionMonitor } from './components/GlobalSessionMonitor'
 import { BatchTranscribeGlobal } from './components/BatchTranscribeGlobal'
 import { BatchImageDecryptGlobal } from './components/BatchImageDecryptGlobal'
+import WindowCloseDialog from './components/WindowCloseDialog'
+
+function RouteStateRedirect({ to }: { to: string }) {
+  const location = useLocation()
+
+  return <Navigate to={to} replace state={location.state} />
+}
 
 function App() {
   const navigate = useNavigate()
   const location = useLocation()
+  const settingsBackgroundRef = useRef<Location>({
+    pathname: '/home',
+    search: '',
+    hash: '',
+    state: null,
+    key: 'settings-fallback'
+  } as Location)
 
   const {
     setDbConnected,
@@ -59,9 +75,19 @@ function App() {
   const isAgreementWindow = location.pathname === '/agreement-window'
   const isOnboardingWindow = location.pathname === '/onboarding-window'
   const isVideoPlayerWindow = location.pathname === '/video-player-window'
-  const isChatHistoryWindow = location.pathname.startsWith('/chat-history/')
+  const isChatHistoryWindow = location.pathname.startsWith('/chat-history/') || location.pathname.startsWith('/chat-history-inline/')
+  const isStandaloneChatWindow = location.pathname === '/chat-window'
   const isNotificationWindow = location.pathname === '/notification-window'
+  const isSettingsRoute = location.pathname === '/settings'
+  const settingsRouteState = location.state as { backgroundLocation?: Location; initialTab?: unknown } | null
+  const routeLocation = isSettingsRoute
+    ? settingsRouteState?.backgroundLocation ?? settingsBackgroundRef.current
+    : location
+  const isExportRoute = routeLocation.pathname === '/export'
   const [themeHydrated, setThemeHydrated] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [showCloseDialog, setShowCloseDialog] = useState(false)
+  const [canMinimizeToTray, setCanMinimizeToTray] = useState(false)
 
   // 锁定状态
   // const [isLocked, setIsLocked] = useState(false) // Moved to store
@@ -74,6 +100,62 @@ function App() {
   const [showAgreement, setShowAgreement] = useState(false)
   const [agreementChecked, setAgreementChecked] = useState(false)
   const [agreementLoading, setAgreementLoading] = useState(true)
+
+  // 数据收集同意状态
+  const [showAnalyticsConsent, setShowAnalyticsConsent] = useState(false)
+
+  const [showWaylandWarning, setShowWaylandWarning] = useState(false)
+
+  useEffect(() => {
+    const checkWaylandStatus = async () => {
+      try {
+        // 防止在非客户端环境报错，先检查 API 是否存在
+        if (!window.electronAPI?.app?.checkWayland) return
+
+        // 通过 configService 检查是否已经弹过窗
+        const hasWarned = await window.electronAPI.config.get('waylandWarningShown')
+
+        if (!hasWarned) {
+          const isWayland = await window.electronAPI.app.checkWayland()
+          if (isWayland) {
+            setShowWaylandWarning(true)
+          }
+        }
+      } catch (e) {
+        console.error('检查 Wayland 状态失败:', e)
+      }
+    }
+
+    // 只有在协议同意之后并且已经进入主应用流程才检查
+    if (!isAgreementWindow && !isOnboardingWindow && !agreementLoading) {
+      checkWaylandStatus()
+    }
+  }, [isAgreementWindow, isOnboardingWindow, agreementLoading])
+
+  const handleDismissWaylandWarning = async () => {
+    try {
+      // 记录到本地配置中，下次不再提示
+      await window.electronAPI.config.set('waylandWarningShown', true)
+    } catch (e) {
+      console.error('保存 Wayland 提示状态失败:', e)
+    }
+    setShowWaylandWarning(false)
+  }
+
+  useEffect(() => {
+    if (location.pathname !== '/settings') {
+      settingsBackgroundRef.current = location
+    }
+  }, [location])
+
+  useEffect(() => {
+    const removeCloseConfirmListener = window.electronAPI.window.onCloseConfirmRequested((payload) => {
+      setCanMinimizeToTray(Boolean(payload.canMinimizeToTray))
+      setShowCloseDialog(true)
+    })
+
+    return () => removeCloseConfirmListener()
+  }, [])
 
   useEffect(() => {
     const root = document.documentElement
@@ -106,10 +188,6 @@ function App() {
       const effectiveMode = mode === 'system' ? (systemDark ?? mq.matches ? 'dark' : 'light') : mode
       document.documentElement.setAttribute('data-theme', currentTheme)
       document.documentElement.setAttribute('data-mode', effectiveMode)
-      const symbolColor = effectiveMode === 'dark' ? '#ffffff' : '#1a1a1a'
-      if (!isOnboardingWindow && !isNotificationWindow) {
-        window.electronAPI.window.setTitleBarOverlay({ symbolColor })
-      }
     }
 
     applyMode(themeMode)
@@ -170,6 +248,14 @@ function App() {
         const agreed = await configService.getAgreementAccepted()
         if (!agreed) {
           setShowAgreement(true)
+        } else {
+          // 协议已同意，检查数据收集同意状态
+          const consent = await configService.getAnalyticsConsent()
+          const denyCount = await configService.getAnalyticsDenyCount()
+          // 如果未设置同意状态且拒绝次数小于2次，显示弹窗
+          if (consent === null && denyCount < 2) {
+            setShowAnalyticsConsent(true)
+          }
         }
       } catch (e) {
         console.error('检查协议状态失败:', e)
@@ -180,14 +266,43 @@ function App() {
     checkAgreement()
   }, [])
 
+  // 初始化数据收集
+  useEffect(() => {
+    cloudControl.initCloudControl()
+  }, [])
+
+  // 记录页面访问
+  useEffect(() => {
+    const path = location.pathname
+    if (path && path !== '/') {
+      cloudControl.recordPage(path)
+    }
+  }, [location.pathname])
+
   const handleAgree = async () => {
     if (!agreementChecked) return
     await configService.setAgreementAccepted(true)
     setShowAgreement(false)
+    // 协议同意后，检查数据收集同意
+    const consent = await configService.getAnalyticsConsent()
+    if (consent === null) {
+      setShowAnalyticsConsent(true)
+    }
   }
 
   const handleDisagree = () => {
     window.electronAPI.window.close()
+  }
+
+  const handleAnalyticsAllow = async () => {
+    await configService.setAnalyticsConsent(true)
+    setShowAnalyticsConsent(false)
+  }
+
+  const handleAnalyticsDeny = async () => {
+    const denyCount = await configService.getAnalyticsDenyCount()
+    await configService.setAnalyticsDenyCount(denyCount + 1)
+    setShowAnalyticsConsent(false)
   }
 
   // 监听启动时的更新通知
@@ -248,6 +363,26 @@ function App() {
 
   const dismissUpdate = () => {
     setUpdateInfo(null)
+  }
+
+  const handleWindowCloseAction = async (
+    action: 'tray' | 'quit' | 'cancel',
+    rememberChoice = false
+  ) => {
+    setShowCloseDialog(false)
+    if (rememberChoice && action !== 'cancel') {
+      try {
+        await configService.setWindowCloseBehavior(action)
+      } catch (error) {
+        console.error('保存关闭偏好失败:', error)
+      }
+    }
+
+    try {
+      await window.electronAPI.window.respondCloseConfirm(action)
+    } catch (error) {
+      console.error('处理关闭确认失败:', error)
+    }
   }
 
   // 启动时自动检查配置并连接数据库
@@ -335,6 +470,8 @@ function App() {
     checkLock()
   }, [isAgreementWindow, isOnboardingWindow, isVideoPlayerWindow])
 
+
+
   // 独立协议窗口
   if (isAgreementWindow) {
     return <AgreementPage />
@@ -360,12 +497,51 @@ function App() {
     return <ChatHistoryPage />
   }
 
+  // 独立会话聊天窗口（仅显示聊天内容区域）
+  if (isStandaloneChatWindow) {
+    const params = new URLSearchParams(location.search)
+    const sessionId = params.get('sessionId') || ''
+    const standaloneSource = params.get('source')
+    const standaloneInitialDisplayName = params.get('initialDisplayName')
+    const standaloneInitialAvatarUrl = params.get('initialAvatarUrl')
+    const standaloneInitialContactType = params.get('initialContactType')
+    return (
+      <ChatPage
+        standaloneSessionWindow
+        initialSessionId={sessionId}
+        standaloneSource={standaloneSource}
+        standaloneInitialDisplayName={standaloneInitialDisplayName}
+        standaloneInitialAvatarUrl={standaloneInitialAvatarUrl}
+        standaloneInitialContactType={standaloneInitialContactType}
+      />
+    )
+  }
+
   // 独立通知窗口
   if (isNotificationWindow) {
     return <NotificationWindow />
   }
 
   // 主窗口 - 完整布局
+  const handleCloseSettings = () => {
+    const backgroundLocation = settingsRouteState?.backgroundLocation ?? settingsBackgroundRef.current
+    if (backgroundLocation.pathname === '/settings') {
+      navigate('/home', { replace: true })
+      return
+    }
+    navigate(
+      {
+        pathname: backgroundLocation.pathname,
+        search: backgroundLocation.search,
+        hash: backgroundLocation.hash
+      },
+      {
+        replace: true,
+        state: backgroundLocation.state
+      }
+    )
+  }
+
   return (
     <div className="app-container">
       <div className="window-drag-region" aria-hidden="true" />
@@ -376,7 +552,10 @@ function App() {
           useHello={lockUseHello}
         />
       )}
-      <TitleBar />
+      <TitleBar
+        sidebarCollapsed={sidebarCollapsed}
+        onToggleSidebar={() => setSidebarCollapsed((prev) => !prev)}
+      />
 
       {/* 全局悬浮进度胶囊 (处理：新版本提示、下载进度、错误提示) */}
       <UpdateProgressCapsule />
@@ -439,6 +618,69 @@ function App() {
         </div>
       )}
 
+      {/* 数据收集同意弹窗 */}
+      {showAnalyticsConsent && !agreementLoading && (
+        <div className="agreement-overlay">
+          <div className="agreement-modal">
+            <div className="agreement-header">
+              <Shield size={32} />
+              <h2>使用数据收集说明</h2>
+            </div>
+            <div className="agreement-content">
+              <div className="agreement-text">
+                <p>为了持续改进 WeFlow 并提供更好的用户体验，我们希望收集一些匿名的使用数据。</p>
+
+                <h4>我们会收集什么？</h4>
+                <p>• 功能使用情况（如哪些功能被使用、使用频率）</p>
+                <p>• 应用性能数据（如加载时间、错误日志）</p>
+                <p>• 设备基本信息（如操作系统版本、应用版本）</p>
+
+                <h4>我们不会收集什么？</h4>
+                <p>• 你的聊天记录内容</p>
+                <p>• 个人身份信息</p>
+                <p>• 联系人信息</p>
+                <p>• 任何可以识别你身份的数据</p>
+                <p>• 一切你担心会涉及隐藏的数据</p>
+
+              </div>
+            </div>
+            <div className="agreement-footer">
+              <div className="agreement-actions">
+                <button className="btn btn-secondary" onClick={handleAnalyticsDeny}>不允许</button>
+                <button className="btn btn-primary" onClick={handleAnalyticsAllow}>允许</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showWaylandWarning && (
+          <div className="agreement-overlay">
+            <div className="agreement-modal">
+              <div className="agreement-header">
+                <Shield size={32} />
+                <h2>环境兼容性提示 (Wayland)</h2>
+              </div>
+              <div className="agreement-content">
+                <div className="agreement-text">
+                  <p>检测到您当前正在使用 <strong>Wayland</strong> 显示服务器。</p>
+                  <p>在 Wayland 环境下，出于系统级的安全与设计机制，<strong>应用程序无法直接控制新弹出窗口的位置</strong>。</p>
+                  <p>这可能导致某些独立窗口（如消息通知、图片查看器等）出现位置随机、或不受控制的情况。这是底层机制导致的，对此我们无能为力。</p>
+                  <br />
+                  <p>如果您觉得窗口位置异常严重影响了使用体验，建议尝试：</p>
+                  <p>1. 在系统登录界面，将会话切换回 <strong>X11 (Xorg)</strong> 模式。</p>
+                  <p>2. 修改您的桌面管理器 (WM/DE) 配置，强制指定该应用程序的窗口规则。</p>
+                </div>
+              </div>
+              <div className="agreement-footer">
+                <div className="agreement-actions">
+                  <button className="btn btn-primary" onClick={handleDismissWaylandWarning}>我知道了，不再提示</button>
+                </div>
+              </div>
+            </div>
+          </div>
+      )}
+
       {/* 更新提示对话框 */}
       <UpdateDialog
         open={showUpdateDialog}
@@ -450,32 +692,50 @@ function App() {
         progress={downloadProgress}
       />
 
+      <WindowCloseDialog
+        open={showCloseDialog}
+        canMinimizeToTray={canMinimizeToTray}
+        onSelect={(action, rememberChoice) => handleWindowCloseAction(action, rememberChoice)}
+        onCancel={() => handleWindowCloseAction('cancel')}
+      />
+
       <div className="main-layout">
-        <Sidebar />
+        <Sidebar collapsed={sidebarCollapsed} />
         <main className="content">
           <RouteGuard>
-            <Routes>
+            <div className={`export-keepalive-page ${isExportRoute ? 'active' : 'hidden'}`} aria-hidden={!isExportRoute}>
+              <ExportPage />
+            </div>
+
+            <Routes location={routeLocation}>
               <Route path="/" element={<HomePage />} />
               <Route path="/home" element={<HomePage />} />
               <Route path="/chat" element={<ChatPage />} />
 
-              <Route path="/analytics" element={<AnalyticsWelcomePage />} />
-              <Route path="/analytics/view" element={<AnalyticsPage />} />
-              <Route path="/group-analytics" element={<GroupAnalyticsPage />} />
+              <Route path="/analytics" element={<ChatAnalyticsHubPage />} />
+              <Route path="/analytics/private" element={<AnalyticsWelcomePage />} />
+              <Route path="/analytics/private/view" element={<AnalyticsPage />} />
+              <Route path="/analytics/group" element={<GroupAnalyticsPage />} />
+              <Route path="/analytics/view" element={<RouteStateRedirect to="/analytics/private/view" />} />
+              <Route path="/group-analytics" element={<RouteStateRedirect to="/analytics/group" />} />
               <Route path="/annual-report" element={<AnnualReportPage />} />
               <Route path="/annual-report/view" element={<AnnualReportWindow />} />
               <Route path="/dual-report" element={<DualReportPage />} />
               <Route path="/dual-report/view" element={<DualReportWindow />} />
 
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/export" element={<ExportPage />} />
+              <Route path="/export" element={<div className="export-route-anchor" aria-hidden="true" />} />
               <Route path="/sns" element={<SnsPage />} />
               <Route path="/contacts" element={<ContactsPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />
+              <Route path="/chat-history-inline/:payloadId" element={<ChatHistoryPage />} />
             </Routes>
           </RouteGuard>
         </main>
       </div>
+
+      {isSettingsRoute && (
+        <SettingsPage onClose={handleCloseSettings} />
+      )}
     </div>
   )
 }

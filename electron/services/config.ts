@@ -16,7 +16,7 @@ interface ConfigSchema {
   imageXorKey: number
   imageAesKey: string
   wxidConfigs: Record<string, { decryptKey?: string; imageXorKey?: number; imageAesKey?: string; updatedAt?: number }>
-
+  exportPath?: string;
   // 缓存相关
   cachePath: string
   lastOpenedDb: string
@@ -34,6 +34,7 @@ interface ConfigSchema {
   autoTranscribeVoice: boolean
   transcribeLanguages: string[]
   exportDefaultConcurrency: number
+  exportDefaultImageDeepSearchOnMiss: boolean
   analyticsExcludedUsernames: string[]
 
   // 安全相关
@@ -47,9 +48,12 @@ interface ConfigSchema {
 
   // 通知
   notificationEnabled: boolean
-  notificationPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'
+  notificationPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'
   notificationFilterMode: 'all' | 'whitelist' | 'blacklist'
   notificationFilterList: string[]
+  messagePushEnabled: boolean
+  windowCloseBehavior: 'ask' | 'tray' | 'quit'
+  quoteLayout: 'quote-top' | 'quote-bottom'
   wordCloudExcludeWords: string[]
 }
 
@@ -82,43 +86,73 @@ export class ConfigService {
       return ConfigService.instance
     }
     ConfigService.instance = this
-    this.store = new Store<ConfigSchema>({
+    const defaults: ConfigSchema = {
+      dbPath: '',
+      decryptKey: '',
+      myWxid: '',
+      onboardingDone: false,
+      imageXorKey: 0,
+      imageAesKey: '',
+      wxidConfigs: {},
+      cachePath: '',
+      lastOpenedDb: '',
+      lastSession: '',
+      theme: 'system',
+      themeId: 'cloud-dancer',
+      language: 'zh-CN',
+      logEnabled: false,
+      llmModelPath: '',
+      whisperModelName: 'base',
+      whisperModelDir: '',
+      whisperDownloadSource: 'tsinghua',
+      autoTranscribeVoice: false,
+      transcribeLanguages: ['zh'],
+      exportDefaultConcurrency: 4,
+      exportDefaultImageDeepSearchOnMiss: true,
+      analyticsExcludedUsernames: [],
+      authEnabled: false,
+      authPassword: '',
+      authUseHello: false,
+      authHelloSecret: '',
+      ignoredUpdateVersion: '',
+      notificationEnabled: true,
+      notificationPosition: 'top-right',
+      notificationFilterMode: 'all',
+      notificationFilterList: [],
+      messagePushEnabled: false,
+      windowCloseBehavior: 'ask',
+      quoteLayout: 'quote-top',
+      wordCloudExcludeWords: []
+    }
+
+    const storeOptions: any = {
       name: 'WeFlow-config',
-      defaults: {
-        dbPath: '',
-        decryptKey: '',
-        myWxid: '',
-        onboardingDone: false,
-        imageXorKey: 0,
-        imageAesKey: '',
-        wxidConfigs: {},
-        cachePath: '',
-        lastOpenedDb: '',
-        lastSession: '',
-        theme: 'system',
-        themeId: 'cloud-dancer',
-        language: 'zh-CN',
-        logEnabled: false,
-        llmModelPath: '',
-        whisperModelName: 'base',
-        whisperModelDir: '',
-        whisperDownloadSource: 'tsinghua',
-        autoTranscribeVoice: false,
-        transcribeLanguages: ['zh'],
-        exportDefaultConcurrency: 2,
-        analyticsExcludedUsernames: [],
-        authEnabled: false,
-        authPassword: '',
-        authUseHello: false,
-        authHelloSecret: '',
-        ignoredUpdateVersion: '',
-        notificationEnabled: true,
-        notificationPosition: 'top-right',
-        notificationFilterMode: 'all',
-        notificationFilterList: [],
-        wordCloudExcludeWords: []
+      defaults,
+      projectName: String(process.env.WEFLOW_PROJECT_NAME || 'WeFlow').trim() || 'WeFlow'
+    }
+    const runningInWorker = process.env.WEFLOW_WORKER === '1'
+    if (runningInWorker) {
+      const cwd = String(process.env.WEFLOW_CONFIG_CWD || process.env.WEFLOW_USER_DATA_PATH || '').trim()
+      if (cwd) {
+        storeOptions.cwd = cwd
       }
-    })
+    }
+
+    try {
+      this.store = new Store<ConfigSchema>(storeOptions)
+    } catch (error) {
+      const message = String((error as Error)?.message || error || '')
+      if (message.includes('projectName')) {
+        const fallbackOptions = {
+          ...storeOptions,
+          projectName: 'WeFlow',
+          cwd: storeOptions.cwd || process.env.WEFLOW_CONFIG_CWD || process.env.WEFLOW_USER_DATA_PATH || process.cwd()
+        }
+        this.store = new Store<ConfigSchema>(fallbackOptions)
+      } else {
+        throw error
+      }
+    }
     this.migrateAuthFields()
   }
 
@@ -658,8 +692,16 @@ export class ConfigService {
     }
   }
 
+  private getUserDataPath(): string {
+    const workerUserDataPath = String(process.env.WEFLOW_USER_DATA_PATH || process.env.WEFLOW_CONFIG_CWD || '').trim()
+    if (workerUserDataPath) {
+      return workerUserDataPath
+    }
+    return app?.getPath?.('userData') || process.cwd()
+  }
+
   getCacheBasePath(): string {
-    return join(app.getPath('userData'), 'cache')
+    return join(this.getUserDataPath(), 'cache')
   }
 
   getAll(): Partial<ConfigSchema> {

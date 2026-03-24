@@ -39,6 +39,9 @@
   --card-bg: rgba(255, 255, 255, 0.7);
   --card-inner-bg: #FAFAF7;
   --sent-card-bg: var(--primary);
+
+  // primary 色上方的前景文字色（大多数主题为白色）
+  --on-primary: white;
 }
 
 // ==================== 浅色主题 ====================
@@ -190,6 +193,31 @@
   --sent-card-bg: var(--primary);
 }
 
+// Geist · 极简黑白 - 浅色
+[data-theme="geist"][data-mode="light"],
+[data-theme="geist"]:not([data-mode]) {
+  --primary: #444444;
+  --primary-rgb: 68, 68, 68;
+  --primary-hover: #333333;
+  --primary-light: rgba(68, 68, 68, 0.08);
+  --bg-primary: #ffffff;
+  --bg-secondary: rgba(250, 250, 250, 0.95);
+  --bg-tertiary: rgba(0, 0, 0, 0.03);
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --text-primary: #111111;
+  --text-secondary: #666666;
+  --text-tertiary: #999999;
+  --border-color: #eaeaea;
+  --border-radius: 6px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.12);
+  --bg-gradient: linear-gradient(135deg, #ffffff 0%, #fafafa 100%);
+  --primary-gradient: linear-gradient(135deg, #444444 0%, #666666 100%);
+  --card-bg: rgba(250, 250, 250, 0.95);
+  --card-inner-bg: #f5f5f5;
+  --sent-card-bg: #444444;
+}
+
 // ==================== 深色主题 ====================
 
 // 云上舞白 - 深色
@@ -339,6 +367,33 @@
   --sent-card-bg: var(--primary);
 }
 
+// Geist · 极简黑白 - 深色
+[data-theme="geist"][data-mode="dark"] {
+  --primary: #ededed;
+  --primary-rgb: 237, 237, 237;
+  --primary-hover: #d5d5d5;
+  --primary-light: rgba(237, 237, 237, 0.1);
+  --bg-primary: #1a1a1a;
+  --bg-secondary: rgba(34, 34, 34, 0.95);
+  --bg-secondary-solid: #222222;
+  --bg-tertiary: rgba(255, 255, 255, 0.04);
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --text-primary: #ededed;
+  --text-secondary: #999999;
+  --text-tertiary: #666666;
+  --border-color: #2e2e2e;
+  --border-radius: 6px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+  --bg-gradient: linear-gradient(135deg, #1a1a1a 0%, #222222 100%);
+  --primary-gradient: linear-gradient(135deg, #ededed 0%, #cccccc 100%);
+  --card-bg: rgba(34, 34, 34, 0.95);
+  --card-inner-bg: #2a2a2a;
+  --sent-card-bg: #3a3a3a;
+  // primary 是浅灰色，上方文字需要用深色
+  --on-primary: #111111;
+}
+
 // 重置样式
 * {
   margin: 0;
@@ -395,7 +450,7 @@ body {
 
   &-primary {
     background: var(--primary);
-    color: white;
+    color: var(--on-primary);
 
     &:hover {
       background: var(--primary-hover);

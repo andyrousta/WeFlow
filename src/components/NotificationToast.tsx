@@ -18,7 +18,7 @@ interface NotificationToastProps {
     onClose: () => void
     onClick: (sessionId: string) => void
     duration?: number
-    position?: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'
+    position?: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'
     isStatic?: boolean
     initialVisible?: boolean
 }

@@ -186,6 +186,33 @@ body {
   word-break: break-word;
 }
 
+.quoted-message {
+  border-left: 3px solid rgba(79, 70, 229, 0.35);
+  background: rgba(79, 70, 229, 0.06);
+  border-radius: 12px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.message.sent .quoted-message {
+  background: rgba(37, 99, 235, 0.08);
+  border-left-color: rgba(37, 99, 235, 0.35);
+}
+
+.quoted-sender {
+  font-size: 12px;
+  color: #374151;
+  font-weight: 600;
+}
+
+.quoted-text {
+  font-size: 13px;
+  color: #4b5563;
+  word-break: break-word;
+}
+
 .message-link-card {
   color: #2563eb;
   text-decoration: underline;

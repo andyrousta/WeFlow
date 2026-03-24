@@ -7,6 +7,7 @@ export interface ChatSession {
   sortTimestamp: number  // 用于排序
   lastTimestamp: number  // 用于显示时间
   lastMsgType: number
+  messageCountHint?: number // 会话总消息数提示（若底层直接可取）
   displayName?: string
   avatarUrl?: string
   lastMsgSender?: string
@@ -14,6 +15,8 @@ export interface ChatSession {
   selfWxid?: string // Helper field to avoid extra API calls
   isFolded?: boolean  // 是否已折叠进"折叠的群聊"
   isMuted?: boolean   // 是否开启免打扰
+  alias?: string      // 微信号
+  matchedField?: 'wxid' | 'alias' | 'name' // 搜索匹配的字段
 }
 
 // 联系人
@@ -33,14 +36,17 @@ export interface ContactInfo {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
   avatarUrl?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
 
 // 消息
 export interface Message {
+  messageKey: string
   localId: number
   serverId: number
+  serverIdRaw?: string
   localType: number
   createTime: number
   sortSeq: number
@@ -103,6 +109,10 @@ export interface Message {
   // 聊天记录
   chatRecordTitle?: string  // 聊天记录标题
   chatRecordList?: ChatRecordItem[]  // 聊天记录列表
+  _db_path?: string
+  // 运行时补充的发送者信息
+  senderDisplayName?: string
+  senderAvatarUrl?: string
 }
 
 // 聊天记录项
@@ -119,11 +129,19 @@ export interface ChatRecordItem {
   dataurl?: string          // 数据URL
   datathumburl?: string     // 缩略图URL
   datacdnurl?: string       // CDN URL
+  cdndatakey?: string       // CDN 数据 key
+  cdnthumbkey?: string      // CDN 缩略图 key
   aeskey?: string           // AES密钥
   md5?: string              // MD5
+  fullmd5?: string          // 原图 MD5
+  thumbfullmd5?: string     // 缩略图 MD5
+  srcMsgLocalid?: number    // 源消息 LocalId
   imgheight?: number        // 图片高度
   imgwidth?: number         // 图片宽度
   duration?: number         // 时长（毫秒）
+  chatRecordTitle?: string  // 嵌套聊天记录标题
+  chatRecordDesc?: string   // 嵌套聊天记录描述
+  chatRecordList?: ChatRecordItem[] // 嵌套聊天记录列表
 }
 
 

@@ -11,6 +11,7 @@ import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
 import { videoService } from './videoService'
 import { imageDecryptService } from './imageDecryptService'
+import { groupAnalyticsService } from './groupAnalyticsService'
 
 // ChatLab 格式定义
 interface ChatLabHeader {
@@ -102,6 +103,8 @@ class HttpService {
   private port: number = 5031
   private running: boolean = false
   private connections: Set<import('net').Socket> = new Set()
+  private messagePushClients: Set<http.ServerResponse> = new Set()
+  private messagePushHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   private connectionMutex: boolean = false
 
   constructor() {
@@ -152,6 +155,7 @@ class HttpService {
 
       this.server.listen(this.port, '127.0.0.1', () => {
         this.running = true
+        this.startMessagePushHeartbeat()
         console.log(`[HttpService] HTTP API server started on http://127.0.0.1:${this.port}`)
         resolve({ success: true, port: this.port })
       })
@@ -164,6 +168,16 @@ class HttpService {
   async stop(): Promise<void> {
     return new Promise((resolve) => {
       if (this.server) {
+        for (const client of this.messagePushClients) {
+          try {
+            client.end()
+          } catch {}
+        }
+        this.messagePushClients.clear()
+        if (this.messagePushHeartbeatTimer) {
+          clearInterval(this.messagePushHeartbeatTimer)
+          this.messagePushHeartbeatTimer = null
+        }
         // 使用互斥锁保护连接集合操作
         this.connectionMutex = true
         const socketsToClose = Array.from(this.connections)
@@ -210,6 +224,28 @@ class HttpService {
     return this.getApiMediaExportPath()
   }
 
+  getMessagePushStreamUrl(): string {
+    return `http://127.0.0.1:${this.port}/api/v1/push/messages`
+  }
+
+  broadcastMessagePush(payload: Record<string, unknown>): void {
+    if (!this.running || this.messagePushClients.size === 0) return
+    const eventBody = `event: message.new\ndata: ${JSON.stringify(payload)}\n\n`
+
+    for (const client of Array.from(this.messagePushClients)) {
+      try {
+        if (client.writableEnded || client.destroyed) {
+          this.messagePushClients.delete(client)
+          continue
+        }
+        client.write(eventBody)
+      } catch {
+        this.messagePushClients.delete(client)
+        try { client.end() } catch {}
+      }
+    }
+  }
+
   /**
    * 处理 HTTP 请求
    */
@@ -232,12 +268,16 @@ class HttpService {
       // 路由处理
       if (pathname === '/health' || pathname === '/api/v1/health') {
         this.sendJson(res, { status: 'ok' })
+      } else if (pathname === '/api/v1/push/messages') {
+        this.handleMessagePushStream(req, res)
       } else if (pathname === '/api/v1/messages') {
         await this.handleMessages(url, res)
       } else if (pathname === '/api/v1/sessions') {
         await this.handleSessions(url, res)
       } else if (pathname === '/api/v1/contacts') {
         await this.handleContacts(url, res)
+      } else if (pathname === '/api/v1/group-members') {
+        await this.handleGroupMembers(url, res)
       } else if (pathname.startsWith('/api/v1/media/')) {
         this.handleMediaRequest(pathname, res)
       } else {
@@ -247,6 +287,50 @@ class HttpService {
       console.error('[HttpService] Request error:', error)
       this.sendError(res, 500, String(error))
     }
+  }
+
+  private startMessagePushHeartbeat(): void {
+    if (this.messagePushHeartbeatTimer) return
+    this.messagePushHeartbeatTimer = setInterval(() => {
+      for (const client of Array.from(this.messagePushClients)) {
+        try {
+          if (client.writableEnded || client.destroyed) {
+            this.messagePushClients.delete(client)
+            continue
+          }
+          client.write(': ping\n\n')
+        } catch {
+          this.messagePushClients.delete(client)
+          try { client.end() } catch {}
+        }
+      }
+    }, 25000)
+  }
+
+  private handleMessagePushStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (this.configService.get('messagePushEnabled') !== true) {
+      this.sendError(res, 403, 'Message push is disabled')
+      return
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    res.flushHeaders?.()
+    res.write(`event: ready\ndata: ${JSON.stringify({ success: true, stream: this.getMessagePushStreamUrl() })}\n\n`)
+
+    this.messagePushClients.add(res)
+
+    const cleanup = () => {
+      this.messagePushClients.delete(res)
+    }
+
+    req.on('close', cleanup)
+    res.on('close', cleanup)
+    res.on('error', cleanup)
   }
 
   private handleMediaRequest(pathname: string, res: http.ServerResponse): void {
@@ -340,6 +424,7 @@ class HttpService {
         const trimmedRows = allRows.slice(0, limit)
         const finalHasMore = hasMore || allRows.length > limit
         const messages = chatService.mapRowsToMessagesForApi(trimmedRows)
+        await this.backfillMissingSenderUsernames(talker, messages)
         return { success: true, messages, hasMore: finalHasMore }
       } finally {
         await wcdbService.closeMessageCursor(cursor)
@@ -357,6 +442,41 @@ class HttpService {
     const parsed = parseInt(value || '', 10)
     if (!Number.isFinite(parsed)) return defaultValue
     return Math.min(Math.max(parsed, min), max)
+  }
+
+  private async backfillMissingSenderUsernames(talker: string, messages: Message[]): Promise<void> {
+    if (!talker.endsWith('@chatroom')) return
+
+    const targets = messages.filter((msg) => !String(msg.senderUsername || '').trim())
+    if (targets.length === 0) return
+
+    const myWxid = (this.configService.get('myWxid') || '').trim()
+    for (const msg of targets) {
+      const localId = Number(msg.localId || 0)
+      if (Number.isFinite(localId) && localId > 0) {
+        try {
+          const detail = await wcdbService.getMessageById(talker, localId)
+          if (detail.success && detail.message) {
+            const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
+            if (hydrated?.senderUsername) {
+              msg.senderUsername = hydrated.senderUsername
+            }
+            if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
+              msg.isSend = hydrated.isSend
+            }
+            if (!msg.rawContent && hydrated?.rawContent) {
+              msg.rawContent = hydrated.rawContent
+            }
+          }
+        } catch (error) {
+          console.warn('[HttpService] backfill sender failed:', error)
+        }
+      }
+
+      if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+        msg.senderUsername = myWxid
+      }
+    }
   }
 
   private parseBooleanParam(url: URL, keys: string[], defaultValue: boolean = false): boolean {
@@ -547,6 +667,54 @@ class HttpService {
         success: true,
         count: limited.length,
         contacts: limited
+      })
+    } catch (error) {
+      this.sendError(res, 500, String(error))
+    }
+  }
+
+  /**
+   * 处理群成员查询
+   * GET /api/v1/group-members?chatroomId=xxx@chatroom&includeMessageCounts=1&forceRefresh=0
+   */
+  private async handleGroupMembers(url: URL, res: http.ServerResponse): Promise<void> {
+    const chatroomId = (url.searchParams.get('chatroomId') || url.searchParams.get('talker') || '').trim()
+    const includeMessageCounts = this.parseBooleanParam(url, ['includeMessageCounts', 'withCounts'], false)
+    const forceRefresh = this.parseBooleanParam(url, ['forceRefresh'], false)
+
+    if (!chatroomId) {
+      this.sendError(res, 400, 'Missing chatroomId')
+      return
+    }
+
+    try {
+      const result = await groupAnalyticsService.getGroupMembersPanelData(chatroomId, {
+        forceRefresh,
+        includeMessageCounts
+      })
+      if (!result.success || !result.data) {
+        this.sendError(res, 500, result.error || 'Failed to get group members')
+        return
+      }
+
+      this.sendJson(res, {
+        success: true,
+        chatroomId,
+        count: result.data.length,
+        fromCache: result.fromCache,
+        updatedAt: result.updatedAt,
+        members: result.data.map((member) => ({
+          wxid: member.username,
+          displayName: member.displayName,
+          nickname: member.nickname || '',
+          remark: member.remark || '',
+          alias: member.alias || '',
+          groupNickname: member.groupNickname || '',
+          avatarUrl: member.avatarUrl,
+          isOwner: Boolean(member.isOwner),
+          isFriend: Boolean(member.isFriend),
+          messageCount: Number.isFinite(member.messageCount) ? member.messageCount : 0
+        }))
       })
     } catch (error) {
       this.sendError(res, 500, String(error))
@@ -762,6 +930,20 @@ class HttpService {
     return 0
   }
 
+  private normalizeAccountId(value: string): string {
+    const trimmed = String(value || '').trim()
+    if (!trimmed) return trimmed
+
+    if (trimmed.toLowerCase().startsWith('wxid_')) {
+      const match = trimmed.match(/^(wxid_[^_]+)/i)
+      if (match) return match[1]
+      return trimmed
+    }
+
+    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    return suffixMatch ? suffixMatch[1] : trimmed
+  }
+
   /**
    * 获取显示名称
    */
@@ -778,6 +960,110 @@ class HttpService {
     return {}
   }
 
+  private async getAvatarUrls(usernames: string[]): Promise<Record<string, string>> {
+    const lookupUsernames = Array.from(new Set(
+      usernames.flatMap((username) => {
+        const normalized = String(username || '').trim()
+        if (!normalized) return []
+        const cleaned = this.normalizeAccountId(normalized)
+        return cleaned && cleaned !== normalized ? [normalized, cleaned] : [normalized]
+      })
+    ))
+
+    if (lookupUsernames.length === 0) return {}
+
+    try {
+      const result = await wcdbService.getAvatarUrls(lookupUsernames)
+      if (result.success && result.map) {
+        const avatarMap: Record<string, string> = {}
+        for (const [username, avatarUrl] of Object.entries(result.map)) {
+          const normalizedUsername = String(username || '').trim()
+          const normalizedAvatarUrl = String(avatarUrl || '').trim()
+          if (!normalizedUsername || !normalizedAvatarUrl) continue
+
+          avatarMap[normalizedUsername] = normalizedAvatarUrl
+          avatarMap[normalizedUsername.toLowerCase()] = normalizedAvatarUrl
+
+          const cleaned = this.normalizeAccountId(normalizedUsername)
+          if (cleaned) {
+            avatarMap[cleaned] = normalizedAvatarUrl
+            avatarMap[cleaned.toLowerCase()] = normalizedAvatarUrl
+          }
+        }
+        return avatarMap
+      }
+    } catch (e) {
+      console.error('[HttpService] Failed to get avatar urls:', e)
+    }
+
+    return {}
+  }
+
+  private resolveAvatarUrl(avatarMap: Record<string, string>, candidates: Array<string | undefined | null>): string | undefined {
+    for (const candidate of candidates) {
+      const normalized = String(candidate || '').trim()
+      if (!normalized) continue
+
+      const cleaned = this.normalizeAccountId(normalized)
+      const avatarUrl = avatarMap[normalized]
+        || avatarMap[normalized.toLowerCase()]
+        || avatarMap[cleaned]
+        || avatarMap[cleaned.toLowerCase()]
+
+      if (avatarUrl) return avatarUrl
+    }
+
+    return undefined
+  }
+
+  private lookupGroupNickname(groupNicknamesMap: Map<string, string>, sender: string): string {
+    if (!sender) return ''
+    const cleaned = this.normalizeAccountId(sender)
+    return groupNicknamesMap.get(sender)
+      || groupNicknamesMap.get(sender.toLowerCase())
+      || groupNicknamesMap.get(cleaned)
+      || groupNicknamesMap.get(cleaned.toLowerCase())
+      || ''
+  }
+
+  private resolveChatLabSenderInfo(
+    msg: Message,
+    talkerId: string,
+    talkerName: string,
+    myWxid: string,
+    isGroup: boolean,
+    senderNames: Record<string, string>,
+    groupNicknamesMap: Map<string, string>
+  ): { sender: string; accountName: string; groupNickname?: string } {
+    let sender = String(msg.senderUsername || '').trim()
+    let usedUnknownPlaceholder = false
+    const sameAsMe = sender && myWxid && sender.toLowerCase() === myWxid.toLowerCase()
+    const isSelf = msg.isSend === 1 || sameAsMe
+
+    if (!sender && isSelf && myWxid) {
+      sender = myWxid
+    }
+
+    if (!sender) {
+      if (msg.localType === 10000 || msg.localType === 266287972401) {
+        sender = talkerId
+      } else {
+        sender = `unknown_sender_${msg.localId || msg.createTime || 0}`
+        usedUnknownPlaceholder = true
+      }
+    }
+
+    const groupNickname = isGroup ? this.lookupGroupNickname(groupNicknamesMap, sender) : ''
+    const displayName = senderNames[sender] || groupNickname || (usedUnknownPlaceholder ? '' : sender)
+    const accountName = isSelf ? '我' : (displayName || '未知发送者')
+
+    return {
+      sender,
+      accountName,
+      groupNickname: groupNickname || undefined
+    }
+  }
+
   /**
    * 转换为 ChatLab 格式
    */
@@ -789,6 +1075,7 @@ class HttpService {
   ): Promise<ChatLabData> {
     const isGroup = talkerId.endsWith('@chatroom')
     const myWxid = this.configService.get('myWxid') || ''
+    const normalizedMyWxid = this.normalizeAccountId(myWxid).toLowerCase()
 
     // 收集所有发送者
     const senderSet = new Set<string>()
@@ -807,7 +1094,21 @@ class HttpService {
       try {
         const result = await wcdbService.getGroupNicknames(talkerId)
         if (result.success && result.nicknames) {
-          groupNicknamesMap = new Map(Object.entries(result.nicknames))
+          groupNicknamesMap = new Map()
+          for (const [memberIdRaw, nicknameRaw] of Object.entries(result.nicknames)) {
+            const memberId = String(memberIdRaw || '').trim()
+            const nickname = String(nicknameRaw || '').trim()
+            if (!memberId || !nickname) continue
+
+            groupNicknamesMap.set(memberId, nickname)
+            groupNicknamesMap.set(memberId.toLowerCase(), nickname)
+
+            const cleaned = this.normalizeAccountId(memberId)
+            if (cleaned) {
+              groupNicknamesMap.set(cleaned, nickname)
+              groupNicknamesMap.set(cleaned.toLowerCase(), nickname)
+            }
+          }
         }
       } catch (e) {
         console.error('[HttpService] Failed to get group nicknames:', e)
@@ -817,36 +1118,45 @@ class HttpService {
     // 构建成员列表
     const memberMap = new Map<string, ChatLabMember>()
     for (const msg of messages) {
-      const sender = msg.senderUsername || ''
-      if (sender && !memberMap.has(sender)) {
-        const displayName = senderNames[sender] || sender
-        const isSelf = sender === myWxid || sender.toLowerCase() === myWxid.toLowerCase()
-        // 获取群昵称（尝试多种方式）
-        const groupNickname = isGroup 
-          ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-          : ''
-        memberMap.set(sender, {
-          platformId: sender,
-          accountName: isSelf ? '我' : displayName,
-          groupNickname: groupNickname || undefined
+      const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
+      if (!memberMap.has(senderInfo.sender)) {
+        memberMap.set(senderInfo.sender, {
+          platformId: senderInfo.sender,
+          accountName: senderInfo.accountName,
+          groupNickname: senderInfo.groupNickname
         })
+      }
+    }
+
+    const [memberAvatarMap, myAvatarResult, sessionAvatarInfo] = await Promise.all([
+      this.getAvatarUrls(Array.from(memberMap.keys()).filter((sender) => !sender.startsWith('unknown_sender_'))),
+      myWxid
+        ? chatService.getMyAvatarUrl()
+        : Promise.resolve<{ success: boolean; avatarUrl?: string }>({ success: true }),
+      isGroup ? chatService.getContactAvatar(talkerId) : Promise.resolve(null)
+    ])
+
+    for (const [sender, member] of memberMap.entries()) {
+      if (sender.startsWith('unknown_sender_')) continue
+
+      const normalizedSender = this.normalizeAccountId(sender).toLowerCase()
+      const isSelfMember = Boolean(normalizedMyWxid && normalizedSender && normalizedSender === normalizedMyWxid)
+      const avatarUrl = (isSelfMember ? myAvatarResult.avatarUrl : undefined)
+        || this.resolveAvatarUrl(memberAvatarMap, isSelfMember ? [sender, myWxid] : [sender])
+
+      if (avatarUrl) {
+        member.avatar = avatarUrl
       }
     }
 
     // 转换消息
     const chatLabMessages: ChatLabMessage[] = messages.map(msg => {
-      const sender = msg.senderUsername || ''
-      const isSelf = msg.isSend === 1 || sender === myWxid
-      const accountName = isSelf ? '我' : (senderNames[sender] || sender)
-      // 获取该发送者的群昵称
-      const groupNickname = isGroup 
-        ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-        : ''
+      const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
 
       return {
-        sender,
-        accountName,
-        groupNickname: groupNickname || undefined,
+        sender: senderInfo.sender,
+        accountName: senderInfo.accountName,
+        groupNickname: senderInfo.groupNickname,
         timestamp: msg.createTime,
         type: this.mapMessageType(msg.localType, msg),
         content: this.getMessageContent(msg),
@@ -866,6 +1176,7 @@ class HttpService {
         platform: 'wechat',
         type: isGroup ? 'group' : 'private',
         groupId: isGroup ? talkerId : undefined,
+        groupAvatar: isGroup ? sessionAvatarInfo?.avatarUrl : undefined,
         ownerId: myWxid || undefined
       },
       members: Array.from(memberMap.values()),
@@ -915,7 +1226,7 @@ class HttpService {
    * 映射 Type 49 子类型
    */
   private mapType49(msg: Message): number {
-    const xmlType = msg.xmlType
+    const xmlType = this.resolveType49Subtype(msg)
 
     switch (xmlType) {
       case '5': // 链接
@@ -939,10 +1250,97 @@ class HttpService {
     }
   }
 
+  private extractType49Subtype(rawContent: string): string {
+    const content = String(rawContent || '')
+    if (!content) return ''
+
+    const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
+    if (appmsgMatch) {
+      const appmsgInner = appmsgMatch[1]
+        .replace(/<refermsg[\s\S]*?<\/refermsg>/gi, '')
+        .replace(/<patMsg[\s\S]*?<\/patMsg>/gi, '')
+      const typeMatch = /<type>([\s\S]*?)<\/type>/i.exec(appmsgInner)
+      if (typeMatch) {
+        return typeMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+      }
+    }
+
+    const fallbackMatch = /<type>([\s\S]*?)<\/type>/i.exec(content)
+    if (fallbackMatch) {
+      return fallbackMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+    }
+
+    return ''
+  }
+
+  private resolveType49Subtype(msg: Message): string {
+    const xmlType = String(msg.xmlType || '').trim()
+    if (xmlType) return xmlType
+
+    const extractedType = this.extractType49Subtype(msg.rawContent)
+    if (extractedType) return extractedType
+
+    switch (msg.appMsgKind) {
+      case 'official-link':
+      case 'link':
+        return '5'
+      case 'file':
+        return '6'
+      case 'chat-record':
+        return '19'
+      case 'miniapp':
+        return '33'
+      case 'quote':
+        return '57'
+      case 'transfer':
+        return '2000'
+      case 'red-packet':
+        return '2001'
+      case 'music':
+        return '3'
+      default:
+        if (msg.linkUrl) return '5'
+        if (msg.fileName) return '6'
+        return ''
+    }
+  }
+
+  private getType49Content(msg: Message): string {
+    const subtype = this.resolveType49Subtype(msg)
+    const title = msg.linkTitle || msg.fileName || ''
+
+    switch (subtype) {
+      case '5':
+      case '49':
+        return title ? `[链接] ${title}` : '[链接]'
+      case '6':
+        return title ? `[文件] ${title}` : '[文件]'
+      case '19':
+        return title ? `[聊天记录] ${title}` : '[聊天记录]'
+      case '33':
+      case '36':
+        return title ? `[小程序] ${title}` : '[小程序]'
+      case '57':
+        return msg.parsedContent || title || '[引用消息]'
+      case '2000':
+        return title ? `[转账] ${title}` : '[转账]'
+      case '2001':
+        return title ? `[红包] ${title}` : '[红包]'
+      case '3':
+        return title ? `[音乐] ${title}` : '[音乐]'
+      default:
+        return msg.parsedContent || title || '[消息]'
+    }
+  }
+
   /**
    * 获取消息内容
    */
   private getMessageContent(msg: Message): string | null {
+    if (msg.localType === 49) {
+      return this.getType49Content(msg)
+    }
+
     // 优先使用已解析的内容
     if (msg.parsedContent) {
       return msg.parsedContent
@@ -965,7 +1363,7 @@ class HttpService {
       case 48:
         return '[位置]'
       case 49:
-        return msg.linkTitle || msg.fileName || '[消息]'
+        return this.getType49Content(msg)
       default:
         return msg.rawContent || null
     }

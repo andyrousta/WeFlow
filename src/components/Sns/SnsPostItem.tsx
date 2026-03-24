@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { Heart, ChevronRight, ImageIcon, Code, Trash2 } from 'lucide-react'
-import { SnsPost, SnsLinkCardData } from '../../types/sns'
+import { Heart, ChevronRight, ImageIcon, Code, Trash2, MapPin } from 'lucide-react'
+import { SnsPost, SnsLinkCardData, SnsLocation } from '../../types/sns'
 import { Avatar } from '../Avatar'
 import { SnsMediaGrid } from './SnsMediaGrid'
 import { getEmojiPath } from 'wechat-emojis'
@@ -134,6 +134,30 @@ const buildLinkCardData = (post: SnsPost): SnsLinkCardData | null => {
     }
 }
 
+const buildLocationText = (location?: SnsLocation): string => {
+    if (!location) return ''
+
+    const normalize = (value?: string): string => (
+        decodeHtmlEntities(String(value || '')).replace(/\s+/g, ' ').trim()
+    )
+
+    const primary = [
+        normalize(location.poiName),
+        normalize(location.poiAddressName),
+        normalize(location.label),
+        normalize(location.poiAddress)
+    ].find(Boolean) || ''
+
+    const region = [normalize(location.country), normalize(location.city)]
+        .filter(Boolean)
+        .join(' ')
+
+    if (primary && region && !primary.includes(region)) {
+        return `${primary} · ${region}`
+    }
+    return primary || region
+}
+
 const SnsLinkCard = ({ card }: { card: SnsLinkCardData }) => {
     const [thumbFailed, setThumbFailed] = useState(false)
     const hostname = useMemo(() => {
@@ -243,15 +267,18 @@ interface SnsPostItemProps {
     post: SnsPost
     onPreview: (src: string, isVideo?: boolean, liveVideoPath?: string) => void
     onDebug: (post: SnsPost) => void
-    onDelete?: (postId: string) => void
+    onDelete?: (postId: string, username: string) => void
+    onOpenAuthorPosts?: (post: SnsPost) => void
+    hideAuthorMeta?: boolean
 }
 
-export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDebug, onDelete }) => {
+export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDebug, onDelete, onOpenAuthorPosts, hideAuthorMeta = false }) => {
     const [mediaDeleted, setMediaDeleted] = useState(false)
     const [dbDeleted, setDbDeleted] = useState(false)
     const [deleting, setDeleting] = useState(false)
     const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
     const linkCard = buildLinkCardData(post)
+    const locationText = useMemo(() => buildLocationText(post.location), [post.location])
     const hasVideoMedia = post.type === 15 || post.media.some((item) => isSnsVideoUrl(item.url))
     const showLinkCard = Boolean(linkCard) && post.media.length <= 1 && !hasVideoMedia
     const showMediaGrid = post.media.length > 0 && !showLinkCard
@@ -299,31 +326,56 @@ export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDeb
             const r = await window.electronAPI.sns.deleteSnsPost(post.tid ?? post.id)
             if (r.success) {
                 setDbDeleted(true)
-                onDelete?.(post.id)
+                onDelete?.(post.id, post.username)
             }
         } finally {
             setDeleting(false)
         }
     }
 
+    const handleOpenAuthorPosts = (e: React.MouseEvent) => {
+        e.stopPropagation()
+        onOpenAuthorPosts?.(post)
+    }
+
     return (
         <>
         <div className={`sns-post-item ${(mediaDeleted || dbDeleted) ? 'post-deleted' : ''}`}>
-            <div className="post-avatar-col">
-                <Avatar
-                    src={post.avatarUrl}
-                    name={post.nickname}
-                    size={48}
-                    shape="rounded"
-                />
-            </div>
+            {!hideAuthorMeta && (
+                <div className="post-avatar-col">
+                    <button
+                        type="button"
+                        className="author-trigger-btn avatar-trigger"
+                        onClick={handleOpenAuthorPosts}
+                        title="查看该发布者的全部朋友圈"
+                    >
+                        <Avatar
+                            src={post.avatarUrl}
+                            name={post.nickname}
+                            size={48}
+                            shape="rounded"
+                        />
+                    </button>
+                </div>
+            )}
 
             <div className="post-content-col">
                 <div className="post-header-row">
-                    <div className="post-author-info">
-                        <span className="author-name">{decodeHtmlEntities(post.nickname)}</span>
-                        <span className="post-time">{formatTime(post.createTime)}</span>
-                    </div>
+                    {hideAuthorMeta ? (
+                        <span className="post-time post-time-standalone">{formatTime(post.createTime)}</span>
+                    ) : (
+                        <div className="post-author-info">
+                            <button
+                                type="button"
+                                className="author-trigger-btn author-name-trigger"
+                                onClick={handleOpenAuthorPosts}
+                                title="查看该发布者的全部朋友圈"
+                            >
+                                <span className="author-name">{decodeHtmlEntities(post.nickname)}</span>
+                            </button>
+                            <span className="post-time">{formatTime(post.createTime)}</span>
+                        </div>
+                    )}
                     <div className="post-header-actions">
                         {(mediaDeleted || dbDeleted) && (
                             <span className="post-deleted-badge">
@@ -350,6 +402,13 @@ export const SnsPostItem: React.FC<SnsPostItemProps> = ({ post, onPreview, onDeb
 
                 {post.contentDesc && (
                     <div className="post-text">{renderTextWithEmoji(decodeHtmlEntities(post.contentDesc))}</div>
+                )}
+
+                {locationText && (
+                    <div className="post-location" title={locationText}>
+                        <MapPin size={14} />
+                        <span className="post-location-text">{locationText}</span>
+                    </div>
                 )}
 
                 {showLinkCard && linkCard && (

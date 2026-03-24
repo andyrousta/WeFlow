@@ -10,6 +10,18 @@
     }
 }
 
+@keyframes noti-enter-center {
+    0% {
+        opacity: 0;
+        transform: translateY(-50px) scale(0.7);
+    }
+
+    100% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
 @keyframes noti-exit {
     0% {
         opacity: 1;
@@ -21,6 +33,18 @@
         opacity: 0;
         transform: scale(0.92) translateY(4px);
         filter: blur(2px);
+    }
+}
+
+@keyframes noti-exit-center {
+    0% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+
+    100% {
+        opacity: 0;
+        transform: translateY(-50px) scale(0.7);
     }
 }
 
@@ -41,6 +65,10 @@ body {
     // New notification slides in
     animation: noti-enter 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     will-change: transform, opacity;
+
+    &.anim-center {
+        animation: noti-enter-center 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
 }
 
 #notification-prev {
@@ -51,4 +79,8 @@ body {
 
     // Ensure it stays behind
     z-index: 0 !important;
+
+    &.anim-center {
+        animation: noti-exit-center 0.5s cubic-bezier(0.33, 1, 0.68, 1) forwards;
+    }
 }

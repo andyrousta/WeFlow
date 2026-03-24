@@ -32,7 +32,7 @@ export interface ChatState {
   setConnectionError: (error: string | null) => void
   setSessions: (sessions: ChatSession[]) => void
   setFilteredSessions: (sessions: ChatSession[]) => void
-  setCurrentSession: (sessionId: string | null) => void
+  setCurrentSession: (sessionId: string | null, options?: { preserveMessages?: boolean }) => void
   setLoadingSessions: (loading: boolean) => void
   setMessages: (messages: Message[]) => void
   appendMessages: (messages: Message[], prepend?: boolean) => void
@@ -69,26 +69,60 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setSessions: (sessions) => set({ sessions, filteredSessions: sessions }),
   setFilteredSessions: (sessions) => set({ filteredSessions: sessions }),
 
-  setCurrentSession: (sessionId) => set({
+  setCurrentSession: (sessionId, options) => set((state) => ({
     currentSessionId: sessionId,
-    messages: [],
+    messages: options?.preserveMessages ? state.messages : [],
     hasMoreMessages: true,
     hasMoreLater: false
-  }),
+  })),
 
   setLoadingSessions: (loading) => set({ isLoadingSessions: loading }),
 
   setMessages: (messages) => set({ messages }),
 
   appendMessages: (newMessages, prepend = false) => set((state) => {
-    // 强制去重逻辑
-    const getMsgKey = (m: Message) => {
-      if (m.localId && m.localId > 0) return `l:${m.localId}`
-      return `t:${m.createTime}:${m.sortSeq || 0}:${m.serverId || 0}`
+    const buildPrimaryKey = (m: Message): string => {
+      if (m.messageKey) return String(m.messageKey)
+      return `fallback:${m.serverId || 0}:${m.createTime}:${m.sortSeq || 0}:${m.localId || 0}:${m.senderUsername || ''}:${m.localType || 0}`
     }
+    const buildAliasKeys = (m: Message): string[] => {
+      const keys = [buildPrimaryKey(m)]
+      const localId = Math.max(0, Number(m.localId || 0))
+      const serverId = Math.max(0, Number(m.serverId || 0))
+      const createTime = Math.max(0, Number(m.createTime || 0))
+      const localType = Math.floor(Number(m.localType || 0))
+      const sender = String(m.senderUsername || '')
+      const isSend = Number(m.isSend ?? -1)
+
+      if (localId > 0) {
+        keys.push(`lid:${localId}`)
+      }
+      if (serverId > 0) {
+        keys.push(`sid:${serverId}`)
+      }
+      if (localType === 3) {
+        const imageIdentity = String(m.imageMd5 || m.imageDatName || '').trim()
+        if (imageIdentity) {
+          keys.push(`img:${createTime}:${sender}:${isSend}:${imageIdentity}`)
+        }
+      }
+      return keys
+    }
+
     const currentMessages = state.messages || []
-    const existingKeys = new Set(currentMessages.map(getMsgKey))
-    const filtered = newMessages.filter(m => !existingKeys.has(getMsgKey(m)))
+    const existingAliases = new Set<string>()
+    currentMessages.forEach((msg) => {
+      buildAliasKeys(msg).forEach((key) => existingAliases.add(key))
+    })
+
+    const filtered: Message[] = []
+    newMessages.forEach((msg) => {
+      const aliasKeys = buildAliasKeys(msg)
+      const exists = aliasKeys.some((key) => existingAliases.has(key))
+      if (exists) return
+      filtered.push(msg)
+      aliasKeys.forEach((key) => existingAliases.add(key))
+    })
 
     if (filtered.length === 0) return state
 

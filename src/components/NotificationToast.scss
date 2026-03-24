@@ -134,6 +134,25 @@
         }
     }
 
+    &.top-center {
+        top: 24px;
+        left: 50%;
+        transform: translate(-50%, -20px) scale(0.95);
+
+        &.visible {
+            transform: translate(-50%, 0) scale(1);
+        }
+
+        // 灵动岛样式
+        border-radius: 40px !important;
+        padding: 12px 16px;
+        box-shadow: 0 12px 48px rgba(0, 0, 0, 0.2);
+
+        &.static {
+            border-radius: 40px !important;
+        }
+    }
+
     &:hover {
         box-shadow: 0 12px 48px rgba(0, 0, 0, 0.16) !important;
     }

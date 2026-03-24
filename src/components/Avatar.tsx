@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { User } from 'lucide-react'
+import { Loader2, User } from 'lucide-react'
 import { avatarLoadQueue } from '../utils/AvatarLoadQueue'
 import './Avatar.scss'
 
@@ -13,6 +13,7 @@ interface AvatarProps {
     shape?: 'circle' | 'square' | 'rounded'
     className?: string
     lazy?: boolean
+    loading?: boolean
     onClick?: () => void
 }
 
@@ -23,12 +24,14 @@ export const Avatar = React.memo(function Avatar({
     shape = 'rounded',
     className = '',
     lazy = true,
+    loading = false,
     onClick
 }: AvatarProps) {
     // 如果 URL 已在缓存中，则直接标记为已加载，不显示骨架屏和淡入动画
     const isCached = useMemo(() => src ? loadedAvatarCache.has(src) : false, [src])
+    const isFailed = useMemo(() => src ? avatarLoadQueue.hasFailed(src) : false, [src])
     const [imageLoaded, setImageLoaded] = useState(isCached)
-    const [imageError, setImageError] = useState(false)
+    const [imageError, setImageError] = useState(isFailed)
     const [shouldLoad, setShouldLoad] = useState(!lazy || isCached)
     const [isInQueue, setIsInQueue] = useState(false)
     const imgRef = useRef<HTMLImageElement>(null)
@@ -42,7 +45,7 @@ export const Avatar = React.memo(function Avatar({
 
     // Intersection Observer for lazy loading
     useEffect(() => {
-        if (!lazy || shouldLoad || isInQueue || !src || !containerRef.current || isCached) return
+        if (!lazy || shouldLoad || isInQueue || !src || !containerRef.current || isCached || imageError || isFailed) return
 
         const observer = new IntersectionObserver(
             (entries) => {
@@ -50,10 +53,11 @@ export const Avatar = React.memo(function Avatar({
                     if (entry.isIntersecting && !isInQueue) {
                         setIsInQueue(true)
                         avatarLoadQueue.enqueue(src).then(() => {
+                            setImageError(false)
                             setShouldLoad(true)
                         }).catch(() => {
-                            // 加载失败不要立刻显示错误，让浏览器渲染去报错
-                            setShouldLoad(true)
+                            setImageError(true)
+                            setShouldLoad(false)
                         }).finally(() => {
                             setIsInQueue(false)
                         })
@@ -67,14 +71,18 @@ export const Avatar = React.memo(function Avatar({
         observer.observe(containerRef.current)
 
         return () => observer.disconnect()
-    }, [src, lazy, shouldLoad, isInQueue, isCached])
+    }, [src, lazy, shouldLoad, isInQueue, isCached, imageError, isFailed])
 
     // Reset state when src changes
     useEffect(() => {
         const cached = src ? loadedAvatarCache.has(src) : false
+        const failed = src ? avatarLoadQueue.hasFailed(src) : false
         setImageLoaded(cached)
-        setImageError(false)
-        if (lazy && !cached) {
+        setImageError(failed)
+        if (failed) {
+            setShouldLoad(false)
+            setIsInQueue(false)
+        } else if (lazy && !cached) {
             setShouldLoad(false)
             setIsInQueue(false)
         } else {
@@ -95,6 +103,7 @@ export const Avatar = React.memo(function Avatar({
     }
 
     const hasValidUrl = !!src && !imageError && shouldLoad
+    const shouldShowLoadingPlaceholder = loading && !hasValidUrl && !imageError
 
     return (
         <div
@@ -112,13 +121,30 @@ export const Avatar = React.memo(function Avatar({
                         alt={name || 'avatar'}
                         className={`avatar-image ${imageLoaded ? 'loaded' : ''} ${isCached ? 'instant' : ''}`}
                         onLoad={() => {
-                            if (src) loadedAvatarCache.add(src)
+                            if (src) {
+                                avatarLoadQueue.clearFailed(src)
+                                loadedAvatarCache.add(src)
+                            }
                             setImageLoaded(true)
+                            setImageError(false)
                         }}
-                        onError={() => setImageError(true)}
+                        onError={() => {
+                            if (src) {
+                                avatarLoadQueue.markFailed(src)
+                                loadedAvatarCache.delete(src)
+                            }
+                            setImageLoaded(false)
+                            setImageError(true)
+                            setShouldLoad(false)
+                        }}
                         loading={lazy ? "lazy" : "eager"}
+                        referrerPolicy="no-referrer"
                     />
                 </>
+            ) : shouldShowLoadingPlaceholder ? (
+                <div className="avatar-loading">
+                    <Loader2 size="50%" className="avatar-loading-icon" />
+                </div>
             ) : (
                 <div className="avatar-placeholder">
                     {name ? <span className="avatar-letter">{getAvatarLetter()}</span> : <User size="50%" />}
