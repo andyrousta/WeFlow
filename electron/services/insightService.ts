@@ -539,59 +539,92 @@ class InsightService {
    *
    * 触发条件（必须同时满足）：
    * 1. 会话有真正的新消息（lastTimestamp 比上次见到的更新）
-   * 2. 该会话距上次活跃分析已超过 2 小时冷却期
+   * 2. 该会话距上次活跃分析已超过冷却期
+   *
+   * 白名单启用时：直接使用白名单里的 sessionId，完全跳过 getSessions()。
+   * 白名单未启用时：从缓存拉取全量会话后过滤私聊。
    */
   private async analyzeRecentActivity(): Promise<void> {
     if (!this.isEnabled()) return
     if (this.processing) return
 
     this.processing = true
-    insightLog('INFO', 'DB 变更防抖触发，开始活跃分析...')
     try {
-      // 使用缓存版本，避免每次 DB 变更都做全量读取（5 分钟 TTL）
-      const sessions = await this.getSessionsCached()
-      if (sessions.length === 0) {
-        insightLog('WARN', '会话缓存为空，跳过活跃分析')
+      const now = Date.now()
+      const cooldownMinutes = (this.config.get('aiInsightCooldownMinutes') as number) ?? 120
+      const cooldownMs = cooldownMinutes * 60 * 1000
+      const whitelistEnabled = this.config.get('aiInsightWhitelistEnabled') as boolean
+      const whitelist = (this.config.get('aiInsightWhitelist') as string[]) || []
+
+      // 白名单启用且有勾选项时，直接用白名单 sessionId，无需查数据库全量会话列表。
+      // 通过拉取该会话最新 1 条消息时间戳判断是否真正有新消息，开销极低。
+      if (whitelistEnabled && whitelist.length > 0) {
+        // 确保数据库已连接（首次时连接，之后复用）
+        if (!this.dbConnected) {
+          const connectResult = await chatService.connect()
+          if (!connectResult.success) return
+          this.dbConnected = true
+        }
+
+        for (const sessionId of whitelist) {
+          if (!sessionId || sessionId.endsWith('@chatroom')) continue
+
+          // 冷却期检查（先过滤，减少不必要的 DB 查询）
+          if (cooldownMs > 0) {
+            const lastAnalysis = this.lastActivityAnalysis.get(sessionId) ?? 0
+            if (cooldownMs - (now - lastAnalysis) > 0) continue
+          }
+
+          // 拉取最新 1 条消息，用时间戳判断是否有新消息，避免全量 getSessions()
+          try {
+            const msgsResult = await chatService.getLatestMessages(sessionId, 1)
+            if (!msgsResult.success || !msgsResult.messages || msgsResult.messages.length === 0) continue
+
+            const latestMsg = msgsResult.messages[0]
+            const latestTs = Number(latestMsg.createTime) || 0
+            const lastSeen = this.lastSeenTimestamp.get(sessionId) ?? 0
+
+            if (latestTs <= lastSeen) continue // 没有新消息
+            this.lastSeenTimestamp.set(sessionId, latestTs)
+          } catch {
+            continue
+          }
+
+          insightLog('INFO', `白名单会话 ${sessionId} 有新消息，准备生成见解...`)
+          this.lastActivityAnalysis.set(sessionId, now)
+
+          // displayName 使用白名单 sessionId，generateInsightForSession 内部会从上下文里获取真实名称
+          await this.generateInsightForSession({
+            sessionId,
+            displayName: sessionId,
+            triggerReason: 'activity'
+          })
+          break // 每次最多处理 1 个会话
+        }
         return
       }
 
-      const now = Date.now()
-
-      // 从 config 读取冷却分钟数（0 = 无冷却）
-      const cooldownMinutes = (this.config.get('aiInsightCooldownMinutes') as number) ?? 120
-      const cooldownMs = cooldownMinutes * 60 * 1000
+      // 白名单未启用：需要拉取全量会话列表，从中过滤私聊
+      const sessions = await this.getSessionsCached()
+      if (sessions.length === 0) return
 
       const privateSessions = sessions.filter((s) => {
         const id = s.username?.trim() || ''
-        return id && !id.endsWith('@chatroom') && !id.toLowerCase().includes('placeholder') && this.isSessionAllowed(id)
+        return id && !id.endsWith('@chatroom') && !id.toLowerCase().includes('placeholder')
       })
 
-      insightLog('INFO', `筛选到 ${privateSessions.length} 个私聊会话（白名单过滤后），冷却期 ${cooldownMinutes} 分钟`)
-
-      let triggeredCount = 0
       for (const session of privateSessions.slice(0, 10)) {
         const sessionId = session.username?.trim() || ''
         if (!sessionId) continue
 
         const currentTimestamp = session.lastTimestamp || 0
         const lastSeen = this.lastSeenTimestamp.get(sessionId) ?? 0
-
-        // 检查是否有真正的新消息
-        if (currentTimestamp <= lastSeen) {
-          continue
-        }
-
-        // 更新已见时间戳
+        if (currentTimestamp <= lastSeen) continue
         this.lastSeenTimestamp.set(sessionId, currentTimestamp)
 
-        // 检查冷却期（0 分钟 = 无冷却，直接通过）
         if (cooldownMs > 0) {
           const lastAnalysis = this.lastActivityAnalysis.get(sessionId) ?? 0
-          const cooldownRemaining = cooldownMs - (now - lastAnalysis)
-          if (cooldownRemaining > 0) {
-            insightLog('INFO', `${session.displayName || sessionId} 冷却中，还需 ${Math.ceil(cooldownRemaining / 60000)} 分钟`)
-            continue
-          }
+          if (cooldownMs - (now - lastAnalysis) > 0) continue
         }
 
         insightLog('INFO', `${session.displayName || sessionId} 有新消息，准备生成见解...`)
@@ -602,13 +635,7 @@ class InsightService {
           displayName: session.displayName || session.username,
           triggerReason: 'activity'
         })
-        triggeredCount++
-
-        break // 每次最多处理 1 个会话
-      }
-
-      if (triggeredCount === 0) {
-        insightLog('INFO', '活跃分析完成，无会话触发见解')
+        break
       }
     } catch (e) {
       insightLog('ERROR', `活跃分析出错: ${(e as Error).message}`)
