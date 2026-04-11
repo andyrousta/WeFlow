@@ -57,16 +57,42 @@ const clampSelectionToBounds = (
   const bounds = resolveBounds(minDate, maxDate)
   if (!bounds) return cloneExportDateRangeSelection(value)
 
-  const rawStart = value.useAllTime ? bounds.minDate : startOfDay(value.dateRange.start)
-  const rawEnd = value.useAllTime ? bounds.maxDate : endOfDay(value.dateRange.end)
-  const nextStart = new Date(Math.min(Math.max(rawStart.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
-  const nextEndCandidate = new Date(Math.min(Math.max(rawEnd.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
-  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? endOfDay(nextStart) : nextEndCandidate
-  const changed = nextStart.getTime() !== rawStart.getTime() || nextEnd.getTime() !== rawEnd.getTime()
+  // For custom selections, only ensure end >= start, preserve time precision
+  if (value.preset === 'custom' && !value.useAllTime) {
+    const { start, end } = value.dateRange
+    if (end.getTime() < start.getTime()) {
+      return {
+        ...value,
+        dateRange: { start, end: start }
+      }
+    }
+    return cloneExportDateRangeSelection(value)
+  }
+
+  // For useAllTime, use bounds directly
+  if (value.useAllTime) {
+    return {
+      preset: value.preset,
+      useAllTime: true,
+      dateRange: {
+        start: bounds.minDate,
+        end: bounds.maxDate
+      }
+    }
+  }
+
+  // For preset selections (not custom), clamp dates to bounds and use default times
+  const nextStart = new Date(Math.min(Math.max(value.dateRange.start.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  const nextEndCandidate = new Date(Math.min(Math.max(value.dateRange.end.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? nextStart : nextEndCandidate
+
+  // Set default times: start at 00:00:00, end at 23:59:59
+  nextStart.setHours(0, 0, 0, 0)
+  nextEnd.setHours(23, 59, 59, 999)
 
   return {
-    preset: value.useAllTime ? value.preset : (changed ? 'custom' : value.preset),
-    useAllTime: value.useAllTime,
+    preset: value.preset,
+    useAllTime: false,
     dateRange: {
       start: nextStart,
       end: nextEnd
@@ -95,13 +121,34 @@ export function ExportDateRangeDialog({
   onClose,
   onConfirm
 }: ExportDateRangeDialogProps) {
+  // Helper: Format date only (YYYY-MM-DD) for the date input field
+  const formatDateOnly = (date: Date): string => {
+    const y = date.getFullYear()
+    const m = `${date.getMonth() + 1}`.padStart(2, '0')
+    const d = `${date.getDate()}`.padStart(2, '0')
+    return `${y}-${m}-${d}`
+  }
+
+  // Helper: Format time only (HH:mm) for the time input field
+  const formatTimeOnly = (date: Date): string => {
+    const h = `${date.getHours()}`.padStart(2, '0')
+    const m = `${date.getMinutes()}`.padStart(2, '0')
+    return `${h}:${m}`
+  }
+
   const [draft, setDraft] = useState<ExportDateRangeDialogDraft>(() => buildDialogDraft(value, minDate, maxDate))
   const [activeBoundary, setActiveBoundary] = useState<ActiveBoundary>('start')
   const [dateInput, setDateInput] = useState({
-    start: formatDateInputValue(value.dateRange.start),
-    end: formatDateInputValue(value.dateRange.end)
+    start: formatDateOnly(value.dateRange.start),
+    end: formatDateOnly(value.dateRange.end)
   })
   const [dateInputError, setDateInputError] = useState({ start: false, end: false })
+
+  // Default times: start at 00:00, end at 23:59
+  const [timeInput, setTimeInput] = useState({
+    start: '00:00',
+    end: '23:59'
+  })
 
   useEffect(() => {
     if (!open) return
@@ -109,48 +156,63 @@ export function ExportDateRangeDialog({
     setDraft(nextDraft)
     setActiveBoundary('start')
     setDateInput({
-      start: formatDateInputValue(nextDraft.dateRange.start),
-      end: formatDateInputValue(nextDraft.dateRange.end)
+      start: formatDateOnly(nextDraft.dateRange.start),
+      end: formatDateOnly(nextDraft.dateRange.end)
     })
+    // For preset-based selections (not custom), use default times 00:00 and 23:59
+    // For custom selections, preserve the time from value.dateRange
+    if (nextDraft.useAllTime || nextDraft.preset !== 'custom') {
+      setTimeInput({
+        start: '00:00',
+        end: '23:59'
+      })
+    } else {
+      setTimeInput({
+        start: formatTimeOnly(nextDraft.dateRange.start),
+        end: formatTimeOnly(nextDraft.dateRange.end)
+      })
+    }
     setDateInputError({ start: false, end: false })
   }, [maxDate, minDate, open, value])
 
   useEffect(() => {
     if (!open) return
     setDateInput({
-      start: formatDateInputValue(draft.dateRange.start),
-      end: formatDateInputValue(draft.dateRange.end)
+      start: formatDateOnly(draft.dateRange.start),
+      end: formatDateOnly(draft.dateRange.end)
     })
+    // Don't sync timeInput here - it's controlled by the time picker
     setDateInputError({ start: false, end: false })
   }, [draft.dateRange.end.getTime(), draft.dateRange.start.getTime(), open])
 
   const bounds = useMemo(() => resolveBounds(minDate, maxDate), [maxDate, minDate])
   const clampStartDate = useCallback((targetDate: Date) => {
-    const start = startOfDay(targetDate)
-    if (!bounds) return start
-    if (start.getTime() < bounds.minDate.getTime()) return bounds.minDate
-    if (start.getTime() > bounds.maxDate.getTime()) return startOfDay(bounds.maxDate)
-    return start
+    if (!bounds) return targetDate
+    const min = bounds.minDate
+    const max = bounds.maxDate
+    if (targetDate.getTime() < min.getTime()) return min
+    if (targetDate.getTime() > max.getTime()) return max
+    return targetDate
   }, [bounds])
   const clampEndDate = useCallback((targetDate: Date) => {
-    const end = endOfDay(targetDate)
-    if (!bounds) return end
-    if (end.getTime() < bounds.minDate.getTime()) return endOfDay(bounds.minDate)
-    if (end.getTime() > bounds.maxDate.getTime()) return bounds.maxDate
-    return end
+    if (!bounds) return targetDate
+    const min = bounds.minDate
+    const max = bounds.maxDate
+    if (targetDate.getTime() < min.getTime()) return min
+    if (targetDate.getTime() > max.getTime()) return max
+    return targetDate
   }, [bounds])
 
   const setRangeStart = useCallback((targetDate: Date) => {
     const start = clampStartDate(targetDate)
     setDraft(prev => {
-      const nextEnd = prev.dateRange.end < start ? endOfDay(start) : prev.dateRange.end
       return {
         ...prev,
         preset: 'custom',
         useAllTime: false,
         dateRange: {
           start,
-          end: nextEnd
+          end: prev.dateRange.end
         },
         panelMonth: toMonthStart(start)
       }
@@ -161,14 +223,13 @@ export function ExportDateRangeDialog({
     const end = clampEndDate(targetDate)
     setDraft(prev => {
       const nextStart = prev.useAllTime ? clampStartDate(targetDate) : prev.dateRange.start
-      const nextEnd = end < nextStart ? endOfDay(nextStart) : end
       return {
         ...prev,
         preset: 'custom',
         useAllTime: false,
         dateRange: {
           start: nextStart,
-          end: nextEnd
+          end: end
         },
         panelMonth: toMonthStart(targetDate)
       }
@@ -206,25 +267,74 @@ export function ExportDateRangeDialog({
     setActiveBoundary('start')
   }, [bounds, maxDate, minDate])
 
+  const parseTimeValue = (timeStr: string): { hours: number; minutes: number } | null => {
+    const matched = /^(\d{1,2}):(\d{2})$/.exec(timeStr.trim())
+    if (!matched) return null
+    const hours = Number(matched[1])
+    const minutes = Number(matched[2])
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null
+    return { hours, minutes }
+  }
+
+  // Handle time picker changes - update draft.dateRange immediately
+  const handleTimePickerChange = useCallback((boundary: 'start' | 'end', timeStr: string) => {
+    setTimeInput(prev => ({ ...prev, [boundary]: timeStr }))
+
+    const parsedTime = parseTimeValue(timeStr)
+    if (!parsedTime) return
+
+    setDraft(prev => {
+      const dateObj = boundary === 'start' ? prev.dateRange.start : prev.dateRange.end
+      const newDate = new Date(dateObj)
+      newDate.setHours(parsedTime.hours, parsedTime.minutes, 0, 0)
+      return {
+        ...prev,
+        preset: 'custom',
+        useAllTime: false,
+        dateRange: {
+          ...prev.dateRange,
+          [boundary]: newDate
+        }
+      }
+    })
+  }, [])
+
+  // Check if date input string contains time (YYYY-MM-DD HH:mm format)
+  const dateInputHasTime = (dateStr: string): boolean => /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(dateStr.trim())
+
   const commitStartFromInput = useCallback(() => {
-    const parsed = parseDateInputValue(dateInput.start)
-    if (!parsed) {
+    const parsedDate = parseDateInputValue(dateInput.start)
+    if (!parsedDate) {
       setDateInputError(prev => ({ ...prev, start: true }))
       return
     }
+    // Only apply time picker value if date input doesn't contain time
+    if (!dateInputHasTime(dateInput.start)) {
+      const parsedTime = parseTimeValue(timeInput.start)
+      if (parsedTime) {
+        parsedDate.setHours(parsedTime.hours, parsedTime.minutes, 0, 0)
+      }
+    }
     setDateInputError(prev => ({ ...prev, start: false }))
-    setRangeStart(parsed)
-  }, [dateInput.start, setRangeStart])
+    setRangeStart(parsedDate)
+  }, [dateInput.start, timeInput.start, setRangeStart])
 
   const commitEndFromInput = useCallback(() => {
-    const parsed = parseDateInputValue(dateInput.end)
-    if (!parsed) {
+    const parsedDate = parseDateInputValue(dateInput.end)
+    if (!parsedDate) {
       setDateInputError(prev => ({ ...prev, end: true }))
       return
     }
+    // Only apply time picker value if date input doesn't contain time
+    if (!dateInputHasTime(dateInput.end)) {
+      const parsedTime = parseTimeValue(timeInput.end)
+      if (parsedTime) {
+        parsedDate.setHours(parsedTime.hours, parsedTime.minutes, 0, 0)
+      }
+    }
     setDateInputError(prev => ({ ...prev, end: false }))
-    setRangeEnd(parsed)
-  }, [dateInput.end, setRangeEnd])
+    setRangeEnd(parsedDate)
+  }, [dateInput.end, timeInput.end, setRangeEnd])
 
   const shiftPanelMonth = useCallback((delta: number) => {
     setDraft(prev => ({
@@ -234,30 +344,47 @@ export function ExportDateRangeDialog({
   }, [])
 
   const handleCalendarSelect = useCallback((targetDate: Date) => {
+    // Use time from timeInput state (which is updated by the time picker)
+    const parseTime = (timeStr: string): { hours: number; minutes: number } => {
+      const matched = /^(\d{1,2}):(\d{2})$/.exec(timeStr.trim())
+      if (!matched) return { hours: 0, minutes: 0 }
+      return { hours: Number(matched[1]), minutes: Number(matched[2]) }
+    }
+
     if (activeBoundary === 'start') {
-      setRangeStart(targetDate)
+      const newStart = new Date(targetDate)
+      const time = parseTime(timeInput.start)
+      newStart.setHours(time.hours, time.minutes, 0, 0)
+      setRangeStart(newStart)
       setActiveBoundary('end')
       return
     }
 
-    setDraft(prev => {
-      const start = prev.useAllTime ? startOfDay(targetDate) : prev.dateRange.start
-      const pickedStart = startOfDay(targetDate)
-      const nextStart = pickedStart <= start ? pickedStart : start
-      const nextEnd = pickedStart <= start ? endOfDay(start) : endOfDay(targetDate)
-      return {
-        ...prev,
-        preset: 'custom',
-        useAllTime: false,
-        dateRange: {
-          start: nextStart,
-          end: nextEnd
-        },
-        panelMonth: toMonthStart(targetDate)
-      }
-    })
+    const pickedStart = startOfDay(targetDate)
+    const start = draft.useAllTime ? startOfDay(targetDate) : draft.dateRange.start
+    const nextStart = pickedStart <= start ? pickedStart : start
+
+    const newEnd = new Date(targetDate)
+    const time = parseTime(timeInput.end)
+    // If selecting same day or going backwards, use 23:59:59, otherwise use the time from timeInput
+    if (pickedStart <= start) {
+      newEnd.setHours(23, 59, 59, 999)
+    } else {
+      newEnd.setHours(time.hours, time.minutes, 59, 999)
+    }
+
+    setDraft(prev => ({
+      ...prev,
+      preset: 'custom',
+      useAllTime: false,
+      dateRange: {
+        start: nextStart,
+        end: newEnd
+      },
+      panelMonth: toMonthStart(targetDate)
+    }))
     setActiveBoundary('start')
-  }, [activeBoundary, setRangeEnd, setRangeStart])
+  }, [activeBoundary, draft.dateRange.start, draft.useAllTime, timeInput.end, timeInput.start, setRangeStart])
 
   const isRangeModeActive = !draft.useAllTime
   const modeText = isRangeModeActive
@@ -364,6 +491,16 @@ export function ExportDateRangeDialog({
               }}
               onBlur={commitStartFromInput}
             />
+            <input
+              type="time"
+              className="export-date-range-time-input"
+              value={timeInput.start}
+              onChange={(event) => {
+                handleTimePickerChange('start', event.target.value)
+              }}
+              onFocus={() => setActiveBoundary('start')}
+              onClick={(event) => event.stopPropagation()}
+            />
           </div>
           <div
             className={`export-date-range-boundary-card ${activeBoundary === 'end' ? 'active' : ''}`}
@@ -390,6 +527,16 @@ export function ExportDateRangeDialog({
                 commitEndFromInput()
               }}
               onBlur={commitEndFromInput}
+            />
+            <input
+              type="time"
+              className="export-date-range-time-input"
+              value={timeInput.end}
+              onChange={(event) => {
+                handleTimePickerChange('end', event.target.value)
+              }}
+              onFocus={() => setActiveBoundary('end')}
+              onClick={(event) => event.stopPropagation()}
             />
           </div>
         </div>
@@ -453,7 +600,14 @@ export function ExportDateRangeDialog({
           <button
             type="button"
             className="export-date-range-dialog-btn primary"
-            onClick={() => onConfirm(cloneExportDateRangeSelection(draft))}
+            onClick={() => {
+              // Validate: end time should not be earlier than start time
+              if (draft.dateRange.end.getTime() < draft.dateRange.start.getTime()) {
+                setDateInputError({ start: true, end: true })
+                return
+              }
+              onConfirm(cloneExportDateRangeSelection(draft))
+            }}
           >
             确认
           </button>
