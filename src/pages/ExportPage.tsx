@@ -1105,21 +1105,42 @@ const clampExportSelectionToBounds = (
 ): ExportDateRangeSelection => {
   if (!bounds) return cloneExportDateRangeSelection(selection)
 
-  const boundedStart = startOfDay(bounds.minDate)
-  const boundedEnd = endOfDay(bounds.maxDate)
-  const originalStart = selection.useAllTime ? boundedStart : startOfDay(selection.dateRange.start)
-  const originalEnd = selection.useAllTime ? boundedEnd : endOfDay(selection.dateRange.end)
-  const nextStart = new Date(Math.min(Math.max(originalStart.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEndCandidate = new Date(Math.min(Math.max(originalEnd.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? endOfDay(nextStart) : nextEndCandidate
-  const rangeChanged = nextStart.getTime() !== originalStart.getTime() || nextEnd.getTime() !== originalEnd.getTime()
+  // For custom selections, only ensure end >= start, preserve time precision
+  if (selection.preset === 'custom' && !selection.useAllTime) {
+    const { start, end } = selection.dateRange
+    if (end.getTime() < start.getTime()) {
+      return {
+        ...selection,
+        dateRange: { start, end: start }
+      }
+    }
+    return cloneExportDateRangeSelection(selection)
+  }
 
+  // For useAllTime, use bounds directly
+  if (selection.useAllTime) {
+    return {
+      preset: selection.preset,
+      useAllTime: true,
+      dateRange: {
+        start: bounds.minDate,
+        end: bounds.maxDate
+      }
+    }
+  }
+
+  // For preset selections (not custom), clamp dates to bounds and use default times
+  const boundedStart = new Date(Math.min(Math.max(selection.dateRange.start.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  const boundedEnd = new Date(Math.min(Math.max(selection.dateRange.end.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  // Use default times: start at 00:00, end at 23:59:59
+  boundedStart.setHours(0, 0, 0, 0)
+  boundedEnd.setHours(23, 59, 59, 999)
   return {
-    preset: selection.useAllTime ? selection.preset : (rangeChanged ? 'custom' : selection.preset),
-    useAllTime: selection.useAllTime,
+    preset: selection.preset,
+    useAllTime: false,
     dateRange: {
-      start: nextStart,
-      end: nextEnd
+      start: boundedStart,
+      end: boundedEnd
     }
   }
 }
@@ -6866,6 +6887,7 @@ function ExportPage() {
     const nextCanExport = Boolean(nextContact && sessionRowByUsername.get(nextContact.username)?.hasSession)
     const previousSelected = Boolean(previousContact && previousCanExport && selectedSessions.has(previousContact.username))
     const nextSelected = Boolean(nextContact && nextCanExport && selectedSessions.has(nextContact.username))
+    const resolvedAvatarUrl = normalizeExportAvatarUrl(matchedSession?.avatarUrl || contact.avatarUrl)
     const rowClassName = [
       'contact-row',
       checked ? 'selected' : '',
@@ -6889,7 +6911,7 @@ function ExportPage() {
             </div>
             <div className="contact-avatar">
               <Avatar
-                src={normalizeExportAvatarUrl(contact.avatarUrl)}
+                src={resolvedAvatarUrl}
                 name={contact.displayName}
                 size="100%"
                 shape="rounded"
