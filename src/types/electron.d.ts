@@ -985,6 +985,7 @@ export interface ElectronAPI {
       pendingSessionIds?: string[]
       successSessionIds?: string[]
       failedSessionIds?: string[]
+      sessionOutputPaths?: Record<string, string>
       error?: string
     }>
     exportSession: (sessionId: string, outputPath: string, options: ExportOptions) => Promise<{

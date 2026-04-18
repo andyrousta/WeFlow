@@ -144,14 +144,14 @@ export class ImageDecryptService {
     for (const key of cacheKeys) {
       const cached = this.resolvedCache.get(key)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const upgraded = this.isThumbnailPath(cached)
+        const upgraded = !this.isHdPath(cached)
           ? await this.tryPromoteThumbnailCache(payload, key, cached)
           : null
         const finalPath = upgraded || cached
         const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
-        const isThumb = this.isThumbnailPath(finalPath)
-        const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
-        if (isThumb) {
+        const isNonHd = !this.isHdPath(finalPath)
+        const hasUpdate = isNonHd ? (this.updateFlags.get(key) ?? false) : false
+        if (isNonHd) {
           if (this.shouldCheckImageUpdate(payload)) {
             this.triggerUpdateCheck(payload, key, finalPath)
           }
@@ -184,15 +184,15 @@ export class ImageDecryptService {
       if (datPath) {
         const existing = this.findCachedOutputByDatPath(datPath, payload.sessionId, false)
         if (existing) {
-          const upgraded = this.isThumbnailPath(existing)
+          const upgraded = !this.isHdPath(existing)
             ? await this.tryPromoteThumbnailCache(payload, cacheKey, existing)
             : null
           const finalPath = upgraded || existing
           this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, finalPath)
           const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
-          const isThumb = this.isThumbnailPath(finalPath)
-          const hasUpdate = isThumb ? (this.updateFlags.get(cacheKey) ?? false) : false
-          if (isThumb) {
+          const isNonHd = !this.isHdPath(finalPath)
+          const hasUpdate = isNonHd ? (this.updateFlags.get(cacheKey) ?? false) : false
+          if (isNonHd) {
             if (this.shouldCheckImageUpdate(payload)) {
               this.triggerUpdateCheck(payload, cacheKey, finalPath)
             }
@@ -219,7 +219,7 @@ export class ImageDecryptService {
     if (payload.force) {
       for (const key of cacheKeys) {
         const cached = this.resolvedCache.get(key)
-        if (cached && existsSync(cached) && this.isImageFile(cached) && !this.isThumbnailPath(cached)) {
+        if (cached && existsSync(cached) && this.isImageFile(cached) && this.isHdPath(cached)) {
           this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, cached)
           this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
           const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
@@ -237,7 +237,7 @@ export class ImageDecryptService {
     if (!payload.force) {
       const cached = this.resolvedCache.get(cacheKey)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const upgraded = this.isThumbnailPath(cached)
+        const upgraded = !this.isHdPath(cached)
           ? await this.tryPromoteThumbnailCache(payload, cacheKey, cached)
           : null
         const finalPath = upgraded || cached
@@ -280,22 +280,13 @@ export class ImageDecryptService {
     if (!accountDir) return
 
     try {
-      const ready = await this.ensureWcdbReady()
-      if (!ready) return
-      const requests = normalizedList.map((md5) => ({ md5, accountDir }))
-      const result = await wcdbService.resolveImageHardlinkBatch(requests)
-      if (!result.success || !Array.isArray(result.rows)) return
-
-      for (const row of result.rows) {
-        const md5 = String(row?.md5 || '').trim().toLowerCase()
-        if (!md5) continue
-        const fileName = String(row?.data?.file_name || '').trim().toLowerCase()
-        const fullPath = String(row?.data?.full_path || '').trim()
-        if (!fileName || !fullPath) continue
-        const selectedPath = this.normalizeHardlinkDatPathByFileName(fullPath, fileName)
-        if (!selectedPath || !existsSync(selectedPath)) continue
+      for (const md5 of normalizedList) {
+        if (!this.looksLikeMd5(md5)) continue
+        const selectedPath = this.selectBestDatPathByBase(accountDir, md5, undefined, undefined, true)
+        if (!selectedPath) continue
         this.cacheDatPath(accountDir, md5, selectedPath)
-        this.cacheDatPath(accountDir, fileName, selectedPath)
+        const fileName = basename(selectedPath).toLowerCase()
+        if (fileName) this.cacheDatPath(accountDir, fileName, selectedPath)
       }
     } catch {
       // ignore preload failures
@@ -477,8 +468,10 @@ export class ImageDecryptService {
       this.logInfo('解密成功', { outputPath, size: decrypted.length })
 
       const isThumb = this.isThumbnailPath(datPath)
+      const isHdCache = this.isHdPath(outputPath)
+      this.removeDuplicateCacheCandidates(datPath, payload.sessionId, outputPath)
       this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, outputPath)
-      if (!isThumb) {
+      if (isHdCache) {
         this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
       } else {
         if (this.shouldCheckImageUpdate(payload)) {
@@ -625,95 +618,49 @@ export class ImageDecryptService {
       allowDatNameScanFallback
     })
 
-    const lookupMd5s = this.collectHardlinkLookupMd5s(imageMd5, imageDatName)
-    const fallbackDatName = String(imageDatName || imageMd5 || '').trim().toLowerCase() || undefined
-    if (lookupMd5s.length === 0) {
-      if (!allowDatNameScanFallback) {
-        this.logInfo('[ImageDecrypt] resolveDatPath skip datName scan (no hardlink md5)', {
-          imageMd5,
-          imageDatName,
-          sessionId,
-          createTime
-        })
-        return null
-      }
-      const packedDatFallback = this.resolveDatPathFromParsedDatName(accountDir, fallbackDatName, sessionId, createTime, allowThumbnail)
-      if (packedDatFallback) {
-        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, packedDatFallback)
-        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, packedDatFallback)
-        const normalizedFileName = basename(packedDatFallback).toLowerCase()
-        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, packedDatFallback)
-        this.logInfo('[ImageDecrypt] datName fallback hit (no hardlink md5)', {
-          imageMd5,
-          imageDatName,
-          selectedPath: packedDatFallback
-        })
-        return packedDatFallback
-      }
-      this.logInfo('[ImageDecrypt] resolveDatPath miss (no hardlink md5)', { imageMd5, imageDatName })
+    const lookupBases = this.collectLookupBasesForScan(imageMd5, imageDatName, allowDatNameScanFallback)
+    if (lookupBases.length === 0) {
+      this.logInfo('[ImageDecrypt] resolveDatPath miss (no lookup base)', { imageMd5, imageDatName })
       return null
     }
 
     if (!skipResolvedCache) {
       const cacheCandidates = Array.from(new Set([
-        ...lookupMd5s,
+        ...lookupBases,
         String(imageMd5 || '').trim().toLowerCase(),
         String(imageDatName || '').trim().toLowerCase()
       ].filter(Boolean)))
       for (const cacheKey of cacheCandidates) {
         const scopedKey = `${accountDir}|${cacheKey}`
         const cached = this.resolvedCache.get(scopedKey)
-        if (!cached) continue
-        if (!existsSync(cached)) continue
-        if (!allowThumbnail && this.isThumbnailPath(cached)) continue
+        if (!cached || !existsSync(cached)) continue
+        if (!allowThumbnail && !this.isHdDatPath(cached)) continue
         return cached
       }
     }
 
-    for (const lookupMd5 of lookupMd5s) {
-      this.logInfo('[ImageDecrypt] hardlink lookup', { lookupMd5, sessionId, hardlinkOnly })
-      const hardlinkPath = await this.resolveHardlinkPath(accountDir, lookupMd5, sessionId)
-      if (!hardlinkPath) continue
-      if (!allowThumbnail && this.isThumbnailPath(hardlinkPath)) continue
+    for (const baseMd5 of lookupBases) {
+      const selectedPath = this.selectBestDatPathByBase(accountDir, baseMd5, sessionId, createTime, allowThumbnail)
+      if (!selectedPath) continue
 
-      this.cacheDatPath(accountDir, lookupMd5, hardlinkPath)
-      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath)
-      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath)
-      const normalizedFileName = basename(hardlinkPath).toLowerCase()
-      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath)
-      return hardlinkPath
-    }
-
-    if (!allowDatNameScanFallback) {
-      this.logInfo('[ImageDecrypt] resolveDatPath skip datName fallback after hardlink miss', {
-        imageMd5,
-        imageDatName,
-        sessionId,
-        createTime,
-        lookupMd5s
+      this.cacheDatPath(accountDir, baseMd5, selectedPath)
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, selectedPath)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, selectedPath)
+      const normalizedFileName = basename(selectedPath).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, selectedPath)
+      this.logInfo('[ImageDecrypt] dat scan selected', {
+        baseMd5,
+        selectedPath,
+        allowThumbnail
       })
-      return null
+      return selectedPath
     }
 
-    const packedDatFallback = this.resolveDatPathFromParsedDatName(accountDir, fallbackDatName, sessionId, createTime, allowThumbnail)
-    if (packedDatFallback) {
-      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, packedDatFallback)
-      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, packedDatFallback)
-      const normalizedFileName = basename(packedDatFallback).toLowerCase()
-      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, packedDatFallback)
-      this.logInfo('[ImageDecrypt] datName fallback hit (hardlink miss)', {
-        imageMd5,
-        imageDatName,
-        lookupMd5s,
-        selectedPath: packedDatFallback
-      })
-      return packedDatFallback
-    }
-
-    this.logInfo('[ImageDecrypt] resolveDatPath miss (hardlink + datName fallback)', {
+    this.logInfo('[ImageDecrypt] resolveDatPath miss (dat scan)', {
       imageMd5,
       imageDatName,
-      lookupMd5s
+      lookupBases,
+      allowThumbnail
     })
     return null
   }
@@ -724,23 +671,46 @@ export class ImageDecryptService {
     cachedPath: string
   ): Promise<boolean> {
     if (!cachedPath || !existsSync(cachedPath)) return false
-    const isThumbnail = this.isThumbnailPath(cachedPath)
-    if (!isThumbnail) return false
+    if (this.isHdPath(cachedPath)) return false
     const wxid = this.configService.get('myWxid')
     const dbPath = this.configService.get('dbPath')
     if (!wxid || !dbPath) return false
     const accountDir = this.resolveAccountDir(dbPath, wxid)
     if (!accountDir) return false
 
-    const hdPath = await this.resolveDatPath(
-      accountDir,
-      payload.imageMd5,
-      payload.imageDatName,
-      payload.sessionId,
-      payload.createTime,
-      { allowThumbnail: false, skipResolvedCache: true, hardlinkOnly: true, allowDatNameScanFallback: false }
-    )
-    return Boolean(hdPath)
+    const lookupBases = this.collectLookupBasesForScan(payload.imageMd5, payload.imageDatName, true)
+    if (lookupBases.length === 0) return false
+
+    let currentTier = this.getCachedPathTier(cachedPath)
+    let bestDatPath: string | null = null
+    let bestDatTier = -1
+    for (const baseMd5 of lookupBases) {
+      const candidate = this.selectBestDatPathByBase(accountDir, baseMd5, payload.sessionId, payload.createTime, true)
+      if (!candidate) continue
+      const candidateTier = this.getDatTier(candidate, baseMd5)
+      if (candidateTier <= 0) continue
+      if (!bestDatPath) {
+        bestDatPath = candidate
+        bestDatTier = candidateTier
+        continue
+      }
+      if (candidateTier > bestDatTier) {
+        bestDatPath = candidate
+        bestDatTier = candidateTier
+        continue
+      }
+      if (candidateTier === bestDatTier) {
+        const candidateSize = this.fileSizeSafe(candidate)
+        const bestSize = this.fileSizeSafe(bestDatPath)
+        if (candidateSize > bestSize) {
+          bestDatPath = candidate
+          bestDatTier = candidateTier
+        }
+      }
+    }
+    if (!bestDatPath || bestDatTier <= 0) return false
+    if (currentTier < 0) currentTier = 1
+    return bestDatTier > currentTier
   }
 
   private async tryPromoteThumbnailCache(
@@ -750,7 +720,7 @@ export class ImageDecryptService {
   ): Promise<string | null> {
     if (!cachedPath || !existsSync(cachedPath)) return null
     if (!this.isImageFile(cachedPath)) return null
-    if (!this.isThumbnailPath(cachedPath)) return null
+    if (this.isHdPath(cachedPath)) return null
 
     const accountDir = this.resolveCurrentAccountDir()
     if (!accountDir) return null
@@ -766,7 +736,7 @@ export class ImageDecryptService {
     if (!hdDatPath) return null
 
     const existingHd = this.findCachedOutputByDatPath(hdDatPath, payload.sessionId, true)
-    if (existingHd && existsSync(existingHd) && this.isImageFile(existingHd) && !this.isThumbnailPath(existingHd)) {
+    if (existingHd && existsSync(existingHd) && this.isImageFile(existingHd) && this.isHdPath(existingHd)) {
       this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingHd)
       this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
       this.removeThumbnailCacheFile(cachedPath, existingHd)
@@ -796,7 +766,7 @@ export class ImageDecryptService {
       ? cachedResult
       : String(upgraded.localPath || '').trim()
     if (!upgradedPath || !existsSync(upgradedPath)) return null
-    if (!this.isImageFile(upgradedPath) || this.isThumbnailPath(upgradedPath)) return null
+    if (!this.isImageFile(upgradedPath) || !this.isHdPath(upgradedPath)) return null
 
     this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, upgradedPath)
     this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
@@ -814,22 +784,71 @@ export class ImageDecryptService {
     if (!oldPath) return
     if (keepPath && oldPath === keepPath) return
     if (!existsSync(oldPath)) return
-    if (!this.isThumbnailPath(oldPath)) return
+    if (this.isHdPath(oldPath)) return
     void rm(oldPath, { force: true }).catch(() => { })
   }
 
   private triggerUpdateCheck(
-    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; disableUpdateCheck?: boolean; suppressEvents?: boolean },
+    payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      createTime?: number
+      preferFilePath?: boolean
+      disableUpdateCheck?: boolean
+      suppressEvents?: boolean
+    },
     cacheKey: string,
     cachedPath: string
   ): void {
     if (!this.shouldCheckImageUpdate(payload)) return
     if (this.updateFlags.get(cacheKey)) return
-    void this.checkHasUpdate(payload, cacheKey, cachedPath).then((hasUpdate) => {
+    void this.checkHasUpdate(payload, cacheKey, cachedPath).then(async (hasUpdate) => {
       if (!hasUpdate) return
       this.updateFlags.set(cacheKey, true)
+      const upgradedPath = await this.tryAutoRefreshBetterCache(payload, cacheKey, cachedPath)
+      if (upgradedPath) {
+        this.updateFlags.delete(cacheKey)
+        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(upgradedPath, payload.preferFilePath))
+        return
+      }
       this.emitImageUpdate(payload, cacheKey)
     }).catch(() => { })
+  }
+
+  private async tryAutoRefreshBetterCache(
+    payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      createTime?: number
+      preferFilePath?: boolean
+      disableUpdateCheck?: boolean
+      suppressEvents?: boolean
+    },
+    cacheKey: string,
+    cachedPath: string
+  ): Promise<string | null> {
+    if (!cachedPath || !existsSync(cachedPath)) return null
+    if (this.isHdPath(cachedPath)) return null
+    const refreshed = await this.decryptImage({
+      sessionId: payload.sessionId,
+      imageMd5: payload.imageMd5,
+      imageDatName: payload.imageDatName,
+      createTime: payload.createTime,
+      preferFilePath: true,
+      force: true,
+      hardlinkOnly: true,
+      disableUpdateCheck: true,
+      suppressEvents: true
+    })
+    if (!refreshed.success || !refreshed.localPath) return null
+    const refreshedPath = String(refreshed.localPath || '').trim()
+    if (!refreshedPath || !existsSync(refreshedPath)) return null
+    if (!this.isImageFile(refreshedPath)) return null
+    this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, refreshedPath)
+    this.removeThumbnailCacheFile(cachedPath, refreshedPath)
+    return refreshedPath
   }
 
 
@@ -852,6 +871,111 @@ export class ImageDecryptService {
     pushMd5(datNameNoExt)
     pushMd5(this.normalizeDatBase(datNameNoExt))
     return keys
+  }
+
+  private collectLookupBasesForScan(imageMd5?: string, imageDatName?: string, allowDatNameScanFallback = true): string[] {
+    const bases = this.collectHardlinkLookupMd5s(imageMd5, imageDatName)
+    if (!allowDatNameScanFallback) return bases
+    const fallbackRaw = String(imageDatName || imageMd5 || '').trim().toLowerCase()
+    if (!fallbackRaw) return bases
+    const fallbackNoExt = fallbackRaw.endsWith('.dat') ? fallbackRaw.slice(0, -4) : fallbackRaw
+    const fallbackBase = this.normalizeDatBase(fallbackNoExt)
+    if (this.looksLikeMd5(fallbackBase) && !bases.includes(fallbackBase)) {
+      bases.push(fallbackBase)
+    }
+    return bases
+  }
+
+  private collectAllDatCandidatesForBase(
+    accountDir: string,
+    baseMd5: string,
+    sessionId?: string,
+    createTime?: number
+  ): string[] {
+    const sessionMonth = this.collectDatCandidatesFromSessionMonth(accountDir, baseMd5, sessionId, createTime)
+    return Array.from(new Set(sessionMonth.filter((item) => {
+      const path = String(item || '').trim()
+      return path && existsSync(path) && path.toLowerCase().endsWith('.dat')
+    })))
+  }
+
+  private isImgScopedDatPath(filePath: string): boolean {
+    const lower = String(filePath || '').toLowerCase()
+    return /[\\/](img|image|msgimg)[\\/]/.test(lower)
+  }
+
+  private fileSizeSafe(filePath: string): number {
+    try {
+      return statSync(filePath).size || 0
+    } catch {
+      return 0
+    }
+  }
+
+  private fileMtimeSafe(filePath: string): number {
+    try {
+      return statSync(filePath).mtimeMs || 0
+    } catch {
+      return 0
+    }
+  }
+
+  private pickLargestDatPath(paths: string[]): string | null {
+    const list = Array.from(new Set(paths.filter(Boolean)))
+    if (list.length === 0) return null
+    list.sort((a, b) => {
+      const sizeDiff = this.fileSizeSafe(b) - this.fileSizeSafe(a)
+      if (sizeDiff !== 0) return sizeDiff
+      const mtimeDiff = this.fileMtimeSafe(b) - this.fileMtimeSafe(a)
+      if (mtimeDiff !== 0) return mtimeDiff
+      return a.localeCompare(b)
+    })
+    return list[0] || null
+  }
+
+  private selectBestDatPathByBase(
+    accountDir: string,
+    baseMd5: string,
+    sessionId?: string,
+    createTime?: number,
+    allowThumbnail = true
+  ): string | null {
+    const candidates = this.collectAllDatCandidatesForBase(accountDir, baseMd5, sessionId, createTime)
+    if (candidates.length === 0) return null
+
+    const imgCandidates = candidates.filter((item) => this.isImgScopedDatPath(item))
+    const imgHdCandidates = imgCandidates.filter((item) => this.isHdDatPath(item))
+    const hdInImg = this.pickLargestDatPath(imgHdCandidates)
+    if (hdInImg) return hdInImg
+
+    if (!allowThumbnail) {
+      // 高清优先仅认 img/image/msgimg 路径中的 H 变体；
+      // 若该范围没有，则交由 allowThumbnail=true 的回退分支按 base.dat/_t 继续挑选。
+      return null
+    }
+
+    // 无 H 时，优先尝试原始无后缀 DAT（{md5}.dat）。
+    const baseDatInImg = this.pickLargestDatPath(
+      imgCandidates.filter((item) => this.isBaseDatPath(item, baseMd5))
+    )
+    if (baseDatInImg) return baseDatInImg
+
+    const baseDatAny = this.pickLargestDatPath(
+      candidates.filter((item) => this.isBaseDatPath(item, baseMd5))
+    )
+    if (baseDatAny) return baseDatAny
+
+    const thumbDatInImg = this.pickLargestDatPath(
+      imgCandidates.filter((item) => this.isTVariantDat(item))
+    )
+    if (thumbDatInImg) return thumbDatInImg
+
+    const thumbDatAny = this.pickLargestDatPath(
+      candidates.filter((item) => this.isTVariantDat(item))
+    )
+    if (thumbDatAny) return thumbDatAny
+
+    return null
   }
 
   private resolveDatPathFromParsedDatName(
@@ -878,7 +1002,7 @@ export class ImageDecryptService {
     if (sessionMonthCandidates.length > 0) {
       const orderedSessionMonth = this.sortDatCandidatePaths(sessionMonthCandidates, baseMd5)
       for (const candidatePath of orderedSessionMonth) {
-        if (!allowThumbnail && this.isThumbnailPath(candidatePath)) continue
+        if (!allowThumbnail && !this.isHdDatPath(candidatePath)) continue
         this.datNameScanMissAt.delete(missKey)
         this.logInfo('[ImageDecrypt] datName fallback selected (session-month)', {
           accountDir,
@@ -894,54 +1018,17 @@ export class ImageDecryptService {
       }
     }
 
-    const hasPreciseContext = Boolean(String(sessionId || '').trim() && monthKey)
-    if (hasPreciseContext) {
-      this.datNameScanMissAt.set(missKey, Date.now())
-      this.logInfo('[ImageDecrypt] datName fallback precise scan miss', {
-        accountDir,
-        sessionId,
-        imageDatName: datNameRaw,
-        createTime,
-        monthKey,
-        baseMd5,
-        allowThumbnail
-      })
-      return null
-    }
-
-    const candidates = this.collectDatCandidatesFromAccountDir(accountDir, baseMd5)
-    if (candidates.length === 0) {
-      this.datNameScanMissAt.set(missKey, Date.now())
-      this.logInfo('[ImageDecrypt] datName fallback scan miss', {
-        accountDir,
-        sessionId,
-        imageDatName: datNameRaw,
-        createTime,
-        monthKey,
-        baseMd5,
-        allowThumbnail
-      })
-      return null
-    }
-
-    const ordered = this.sortDatCandidatePaths(candidates, baseMd5)
-    for (const candidatePath of ordered) {
-      if (!allowThumbnail && this.isThumbnailPath(candidatePath)) continue
-      this.datNameScanMissAt.delete(missKey)
-      this.logInfo('[ImageDecrypt] datName fallback selected', {
-        accountDir,
-        sessionId,
-        imageDatName: datNameRaw,
-        createTime,
-        monthKey,
-        baseMd5,
-        allowThumbnail,
-        selectedPath: candidatePath
-      })
-      return candidatePath
-    }
-
+    // 新策略：只扫描会话月目录，不做 account-wide 根目录回退。
     this.datNameScanMissAt.set(missKey, Date.now())
+    this.logInfo('[ImageDecrypt] datName fallback precise scan miss', {
+      accountDir,
+      sessionId,
+      imageDatName: datNameRaw,
+      createTime,
+      monthKey,
+      baseMd5,
+      allowThumbnail
+    })
     return null
   }
 
@@ -966,27 +1053,14 @@ export class ImageDecryptService {
     const monthKey = this.resolveYearMonthFromCreateTime(createTime)
     if (!normalizedSessionId || !monthKey) return []
 
-    const attachRoots = this.getAttachScanRoots(accountDir)
-    const cacheRoots = this.getMessageCacheScanRoots(accountDir)
-    const sessionDirs = this.getAttachSessionDirCandidates(normalizedSessionId)
+    const sessionDir = this.resolveSessionDirForStorage(normalizedSessionId)
+    if (!sessionDir) return []
     const candidates = new Set<string>()
-    const budget = { remaining: 600 }
-    const targetDirs: Array<{ dir: string; depth: number }> = []
-
-    for (const root of attachRoots) {
-      for (const sessionDir of sessionDirs) {
-        targetDirs.push({ dir: join(root, sessionDir, monthKey), depth: 2 })
-        targetDirs.push({ dir: join(root, sessionDir, monthKey, 'Img'), depth: 1 })
-        targetDirs.push({ dir: join(root, sessionDir, monthKey, 'Image'), depth: 1 })
-      }
-    }
-
-    for (const root of cacheRoots) {
-      for (const sessionDir of sessionDirs) {
-        targetDirs.push({ dir: join(root, monthKey, 'Message', sessionDir, 'Bubble'), depth: 1 })
-        targetDirs.push({ dir: join(root, monthKey, 'Message', sessionDir), depth: 2 })
-      }
-    }
+    const budget = { remaining: 240 }
+    const targetDirs: Array<{ dir: string; depth: number }> = [
+      // 1) accountDir/msg/attach/{sessionMd5}/{yyyy-MM}/Img
+      { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 }
+    ]
 
     for (const target of targetDirs) {
       if (budget.remaining <= 0) break
@@ -996,98 +1070,13 @@ export class ImageDecryptService {
     return Array.from(candidates)
   }
 
-  private getAttachScanRoots(accountDir: string): string[] {
-    const roots: string[] = []
-    const push = (value: string) => {
-      const normalized = String(value || '').trim()
-      if (!normalized) return
-      if (!roots.includes(normalized)) roots.push(normalized)
-    }
-
-    push(join(accountDir, 'msg', 'attach'))
-    push(join(accountDir, 'attach'))
-    const parent = dirname(accountDir)
-    if (parent && parent !== accountDir) {
-      push(join(parent, 'msg', 'attach'))
-      push(join(parent, 'attach'))
-    }
-    return roots
-  }
-
-  private getMessageCacheScanRoots(accountDir: string): string[] {
-    const roots: string[] = []
-    const push = (value: string) => {
-      const normalized = String(value || '').trim()
-      if (!normalized) return
-      if (!roots.includes(normalized)) roots.push(normalized)
-    }
-
-    push(join(accountDir, 'cache'))
-    const parent = dirname(accountDir)
-    if (parent && parent !== accountDir) {
-      push(join(parent, 'cache'))
-    }
-    return roots
-  }
-
-  private getAttachSessionDirCandidates(sessionId: string): string[] {
-    const normalized = String(sessionId || '').trim()
-    if (!normalized) return []
-    const lower = normalized.toLowerCase()
-    const cleaned = this.cleanAccountDirName(normalized)
-    const inputs = Array.from(new Set([normalized, lower, cleaned, cleaned.toLowerCase()].filter(Boolean)))
-    const results: string[] = []
-    const push = (value: string) => {
-      if (!value) return
-      if (!results.includes(value)) results.push(value)
-    }
-
-    for (const item of inputs) {
-      push(item)
-      const md5 = crypto.createHash('md5').update(item).digest('hex').toLowerCase()
-      push(md5)
-      push(md5.slice(0, 16))
-    }
-    return results
-  }
-
-  private collectDatCandidatesFromAccountDir(accountDir: string, baseMd5: string): string[] {
-    const roots = this.getDatScanRoots(accountDir)
-    const candidates = new Set<string>()
-    const budget = { remaining: 1400 }
-
-    for (const item of roots) {
-      if (budget.remaining <= 0) break
-      this.scanDatCandidatesUnderRoot(item.root, baseMd5, item.maxDepth, candidates, budget)
-    }
-
-    if (candidates.size === 0 && budget.remaining <= 0) {
-      this.logInfo('[ImageDecrypt] datName fallback budget exhausted', {
-        accountDir,
-        baseMd5,
-        roots: roots.map((item) => item.root)
-      })
-    }
-
-    return Array.from(candidates)
-  }
-
-  private getDatScanRoots(accountDir: string): Array<{ root: string; maxDepth: number }> {
-    const roots: Array<{ root: string; maxDepth: number }> = []
-    const push = (root: string, maxDepth: number) => {
-      const normalized = String(root || '').trim()
-      if (!normalized) return
-      if (roots.some((item) => item.root === normalized)) return
-      roots.push({ root: normalized, maxDepth })
-    }
-
-    push(join(accountDir, 'attach'), 4)
-    push(join(accountDir, 'msg', 'attach'), 4)
-    push(join(accountDir, 'FileStorage', 'Image'), 3)
-    push(join(accountDir, 'FileStorage', 'Image2'), 3)
-    push(join(accountDir, 'FileStorage', 'MsgImg'), 3)
-
-    return roots
+  private resolveSessionDirForStorage(sessionId: string): string {
+    const normalized = String(sessionId || '').trim().toLowerCase()
+    if (!normalized) return ''
+    if (this.looksLikeMd5(normalized)) return normalized
+    const cleaned = this.cleanAccountDirName(normalized).toLowerCase()
+    if (this.looksLikeMd5(cleaned)) return cleaned
+    return crypto.createHash('md5').update(cleaned || normalized).digest('hex').toLowerCase()
   }
 
   private scanDatCandidatesUnderRoot(
@@ -1296,17 +1285,60 @@ export class ImageDecryptService {
     }
   }
 
+  private getCacheVariantSuffixFromDat(datPath: string): string {
+    if (this.isHdDatPath(datPath)) return '_hd'
+    const name = basename(datPath)
+    const lower = name.toLowerCase()
+    const stem = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
+    const base = this.normalizeDatBase(stem)
+    const rawSuffix = stem.slice(base.length)
+    if (!rawSuffix) return ''
+    const safe = rawSuffix.replace(/[^a-z0-9._-]/g, '')
+    if (!safe) return ''
+    if (safe.startsWith('_') || safe.startsWith('.')) return safe
+    return `_${safe}`
+  }
+
+  private getCacheVariantSuffixFromCachedPath(cachePath: string): string {
+    const raw = String(cachePath || '').split('?')[0]
+    const name = basename(raw)
+    const ext = extname(name).toLowerCase()
+    const stem = (ext ? name.slice(0, -ext.length) : name).toLowerCase()
+    const base = this.normalizeDatBase(stem)
+    const rawSuffix = stem.slice(base.length)
+    if (!rawSuffix) return ''
+    const safe = rawSuffix.replace(/[^a-z0-9._-]/g, '')
+    if (!safe) return ''
+    if (safe.startsWith('_') || safe.startsWith('.')) return safe
+    return `_${safe}`
+  }
+
+  private buildCacheSuffixSearchOrder(primarySuffix: string, preferHd: boolean): string[] {
+    const fallbackSuffixes = [
+      '_hd',
+      '_thumb',
+      '_t',
+      '.t',
+      '_b',
+      '.b',
+      '_w',
+      '.w',
+      '_c',
+      '.c',
+      ''
+    ]
+    const ordered = preferHd
+      ? ['_hd', primarySuffix, ...fallbackSuffixes]
+      : [primarySuffix, '_hd', ...fallbackSuffixes]
+    return Array.from(new Set(ordered.map((item) => String(item || '').trim()).filter((item) => item.length >= 0)))
+  }
+
   private getCacheOutputPathFromDat(datPath: string, ext: string, sessionId?: string): string {
     const name = basename(datPath)
     const lower = name.toLowerCase()
-    const base = lower.endsWith('.dat') ? name.slice(0, -4) : name
-
-    // 提取基础名称（去掉 _t, _h 等后缀）
+    const base = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
     const normalizedBase = this.normalizeDatBase(base)
-
-    // 判断是缩略图还是高清图
-    const isThumb = this.isThumbnailDat(lower)
-    const suffix = isThumb ? '_thumb' : '_hd'
+    const suffix = this.getCacheVariantSuffixFromDat(datPath)
 
     const contactDir = this.sanitizeDirName(sessionId || 'unknown')
     const timeDir = this.resolveTimeDir(datPath)
@@ -1319,9 +1351,10 @@ export class ImageDecryptService {
   private buildCacheOutputCandidatesFromDat(datPath: string, sessionId?: string, preferHd = false): string[] {
     const name = basename(datPath)
     const lower = name.toLowerCase()
-    const base = lower.endsWith('.dat') ? name.slice(0, -4) : name
+    const base = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
     const normalizedBase = this.normalizeDatBase(base)
-    const suffixes = preferHd ? ['_hd', '_thumb'] : ['_thumb', '_hd']
+    const primarySuffix = this.getCacheVariantSuffixFromDat(datPath)
+    const suffixes = this.buildCacheSuffixSearchOrder(primarySuffix, preferHd)
     const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
 
     const root = this.getCacheRoot()
@@ -1352,6 +1385,20 @@ export class ImageDecryptService {
     }
 
     return candidates
+  }
+
+  private removeDuplicateCacheCandidates(datPath: string, sessionId: string | undefined, keepPath: string): void {
+    const candidateSets = [
+      ...this.buildCacheOutputCandidatesFromDat(datPath, sessionId, false),
+      ...this.buildCacheOutputCandidatesFromDat(datPath, sessionId, true)
+    ]
+    const candidates = Array.from(new Set(candidateSets))
+    for (const candidate of candidates) {
+      if (!candidate || candidate === keepPath) continue
+      if (!existsSync(candidate)) continue
+      if (!this.isImageFile(candidate)) continue
+      void rm(candidate, { force: true }).catch(() => { })
+    }
   }
 
   private findCachedOutputByDatPath(datPath: string, sessionId?: string, preferHd = false): string | null {
@@ -1786,8 +1833,54 @@ export class ImageDecryptService {
     return lower.includes('_t.dat') || lower.includes('.t.dat') || lower.includes('_thumb.dat')
   }
 
+  private isHdDatPath(datPath: string): boolean {
+    const name = basename(String(datPath || '')).toLowerCase()
+    if (!name.endsWith('.dat')) return false
+    const stem = name.slice(0, -4)
+    return (
+      stem.endsWith('_h') ||
+      stem.endsWith('.h') ||
+      stem.endsWith('_hd') ||
+      stem.endsWith('.hd')
+    )
+  }
+
+  private isTVariantDat(datPath: string): boolean {
+    const name = basename(String(datPath || '')).toLowerCase()
+    return this.isThumbnailDat(name)
+  }
+
+  private isBaseDatPath(datPath: string, baseMd5: string): boolean {
+    const normalizedBase = String(baseMd5 || '').trim().toLowerCase()
+    if (!normalizedBase) return false
+    const name = basename(String(datPath || '')).toLowerCase()
+    return name === `${normalizedBase}.dat`
+  }
+
+  private getDatTier(datPath: string, baseMd5: string): number {
+    if (this.isHdDatPath(datPath)) return 3
+    if (this.isBaseDatPath(datPath, baseMd5)) return 2
+    if (this.isTVariantDat(datPath)) return 1
+    return 0
+  }
+
+  private getCachedPathTier(cachePath: string): number {
+    if (this.isHdPath(cachePath)) return 3
+    const suffix = this.getCacheVariantSuffixFromCachedPath(cachePath)
+    if (!suffix) return 2
+    const normalized = suffix.toLowerCase()
+    if (normalized === '_t' || normalized === '.t' || normalized === '_thumb' || normalized === '.thumb') {
+      return 1
+    }
+    return 1
+  }
+
   private isHdPath(p: string): boolean {
-    return p.toLowerCase().includes('_hd') || p.toLowerCase().includes('_h')
+    const raw = String(p || '').split('?')[0]
+    const name = basename(raw).toLowerCase()
+    const ext = extname(name).toLowerCase()
+    const stem = ext ? name.slice(0, -ext.length) : name
+    return stem.endsWith('_hd')
   }
 
   private isThumbnailPath(p: string): boolean {

@@ -178,6 +178,7 @@ interface ExportTask {
   title: string
   status: TaskStatus
   settledSessionIds?: string[]
+  sessionOutputPaths?: Record<string, string>
   createdAt: number
   startedAt?: number
   finishedAt?: number
@@ -651,6 +652,32 @@ const formatPathBrief = (value: string, maxLength = 52): string => {
   const headLength = Math.max(10, Math.floor(maxLength * 0.55))
   const tailLength = Math.max(8, maxLength - headLength - 1)
   return `${normalized.slice(0, headLength)}…${normalized.slice(-tailLength)}`
+}
+
+const resolveParentDir = (value: string): string => {
+  const normalized = String(value || '').trim()
+  if (!normalized) return ''
+  const noTrailing = normalized.replace(/[\\/]+$/, '')
+  if (!noTrailing) return normalized
+  const lastSlash = Math.max(noTrailing.lastIndexOf('/'), noTrailing.lastIndexOf('\\'))
+  if (lastSlash < 0) return normalized
+  if (lastSlash === 0) return noTrailing.slice(0, 1)
+  if (/^[A-Za-z]:$/.test(noTrailing.slice(0, lastSlash))) {
+    return `${noTrailing.slice(0, lastSlash)}\\`
+  }
+  return noTrailing.slice(0, lastSlash)
+}
+
+const resolveTaskOpenDir = (task: ExportTask): string => {
+  const sessionIds = Array.isArray(task.payload.sessionIds) ? task.payload.sessionIds : []
+  if (sessionIds.length === 1) {
+    const onlySessionId = String(sessionIds[0] || '').trim()
+    const outputPath = onlySessionId ? String(task.sessionOutputPaths?.[onlySessionId] || '').trim() : ''
+    if (outputPath) {
+      return resolveParentDir(outputPath) || task.payload.outputDir
+    }
+  }
+  return task.payload.outputDir
 }
 
 const formatRecentExportTime = (timestamp?: number, now = Date.now()): string => {
@@ -2005,7 +2032,14 @@ const TaskCenterModal = memo(function TaskCenterModal({
                           {isPerfExpanded ? '收起详情' : '性能详情'}
                         </button>
                       )}
-                      <button className="task-action-btn" onClick={() => task.payload.outputDir && void window.electronAPI.shell.openPath(task.payload.outputDir)}>
+                      <button
+                        className="task-action-btn"
+                        onClick={() => {
+                          const openDir = resolveTaskOpenDir(task)
+                          if (!openDir) return
+                          void window.electronAPI.shell.openPath(openDir)
+                        }}
+                      >
                         <FolderOpen size={14} /> 目录
                       </button>
                     </div>
@@ -5715,6 +5749,12 @@ function ExportPage() {
             ...task,
             status: 'success',
             finishedAt: doneAt,
+            sessionOutputPaths: {
+              ...(task.sessionOutputPaths || {}),
+              ...((result.sessionOutputPaths && typeof result.sessionOutputPaths === 'object')
+                ? result.sessionOutputPaths
+                : {})
+            },
             progress: {
               ...task.progress,
               current: task.progress.total || next.payload.sessionIds.length,

@@ -175,6 +175,21 @@ function formatTimestamp(ts: number): string {
   return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+function formatPromptCurrentTime(date: Date = new Date()): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  return `当前系统时间：${year}年${month}月${day}日 ${hours}:${minutes}`
+}
+
+function appendPromptCurrentTime(prompt: string): string {
+  const base = String(prompt || '').trimEnd()
+  if (!base) return formatPromptCurrentTime()
+  return `${base}\n\n${formatPromptCurrentTime()}`
+}
+
 function normalizeApiMaxTokens(value: unknown): number {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return API_MAX_TOKENS_DEFAULT
@@ -421,7 +436,7 @@ class InsightService {
 
     try {
       const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
-      const requestMessages = [{ role: 'user', content: '请回复"连接成功"四个字。' }]
+      const requestMessages = [{ role: 'user', content: appendPromptCurrentTime('请回复"连接成功"四个字。') }]
       insightDebugSection(
         'INFO',
         'AI 测试连接请求',
@@ -568,7 +583,7 @@ class InsightService {
     const customPrompt = String(this.config.get('aiFootprintSystemPrompt') || '').trim()
     const systemPrompt = customPrompt || defaultSystemPrompt
 
-    const userPrompt = `统计范围：${rangeLabel}
+    const userPromptBase = `统计范围：${rangeLabel}
 有聊天的人数：${Number(summary.private_inbound_people) || 0}
 我有回复的人数：${Number(summary.private_outbound_people) || 0}
 回复率：${(((Number(summary.private_reply_rate) || 0) * 100)).toFixed(1)}%
@@ -582,6 +597,7 @@ ${topPrivateText}
 ${topMentionText}
 
 请给出足迹复盘（2-3句，含建议）：`
+    const userPrompt = appendPromptCurrentTime(userPromptBase)
 
     try {
       const result = await callApi(
@@ -1126,7 +1142,7 @@ ${topMentionText}
 
     const globalStatsDesc = `今天全部联系人合计已触发 ${totalTodayTriggers} 条见解。`
 
-    const userPrompt = [
+    const userPromptBase = [
       `触发原因：${triggerDesc}`,
       `时间统计：${todayStatsDesc}`,
       `全局统计：${globalStatsDesc}`,
@@ -1134,6 +1150,7 @@ ${topMentionText}
       socialContextSection,
       '请给出你的见解（≤80字）：'
     ].filter(Boolean).join('\n\n')
+    const userPrompt = appendPromptCurrentTime(userPromptBase)
 
     const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
     const requestMessages = [

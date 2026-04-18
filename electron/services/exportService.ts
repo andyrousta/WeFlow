@@ -3780,7 +3780,6 @@ class ExportService {
 
     const md5Pattern = /^[a-f0-9]{32}$/i
     const imageMd5Set = new Set<string>()
-    const videoMd5Set = new Set<string>()
 
     let scanIndex = 0
     for (const msg of messages) {
@@ -3800,18 +3799,11 @@ class ExportService {
         }
       }
 
-      if (options.exportVideos && msg?.localType === 43) {
-        const videoMd5 = String(msg?.videoMd5 || '').trim().toLowerCase()
-        if (videoMd5) videoMd5Set.add(videoMd5)
-      }
     }
 
     const preloadTasks: Array<Promise<void>> = []
     if (imageMd5Set.size > 0) {
       preloadTasks.push(imageDecryptService.preloadImageHardlinkMd5s(Array.from(imageMd5Set)))
-    }
-    if (videoMd5Set.size > 0) {
-      preloadTasks.push(videoService.preloadVideoHardlinkMd5s(Array.from(videoMd5Set)))
     }
     if (preloadTasks.length === 0) return
 
@@ -4100,6 +4092,95 @@ class ExportService {
     }
     const tagMatch = /<md5>([^<]+)<\/md5>/i.exec(content)
     return tagMatch?.[1]?.toLowerCase()
+  }
+
+  private decodePackedInfoBuffer(raw: unknown): Buffer | null {
+    if (!raw) return null
+    if (Buffer.isBuffer(raw)) return raw
+    if (raw instanceof Uint8Array) return Buffer.from(raw)
+    if (Array.isArray(raw)) return Buffer.from(raw)
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim()
+      if (!trimmed) return null
+      const compactHex = trimmed.replace(/\s+/g, '')
+      if (/^[a-fA-F0-9]+$/.test(compactHex) && compactHex.length % 2 === 0) {
+        try {
+          return Buffer.from(compactHex, 'hex')
+        } catch { }
+      }
+      try {
+        const decoded = Buffer.from(trimmed, 'base64')
+        if (decoded.length > 0) return decoded
+      } catch { }
+      return null
+    }
+    if (typeof raw === 'object' && raw !== null && Array.isArray((raw as any).data)) {
+      return Buffer.from((raw as any).data)
+    }
+    return null
+  }
+
+  private normalizeVideoFileToken(value: unknown): string | undefined {
+    let text = String(value || '').trim().toLowerCase()
+    if (!text) return undefined
+    text = text.replace(/^.*[\\/]/, '')
+    text = text.replace(/\.(?:mp4|mov|m4v|avi|mkv|flv|jpg|jpeg|png|gif|dat)$/i, '')
+    text = text.replace(/_thumb$/, '')
+    const direct = /^([a-f0-9]{16,64})(?:_raw)?$/i.exec(text)
+    if (direct) {
+      const suffix = /_raw$/i.test(text) ? '_raw' : ''
+      return `${direct[1].toLowerCase()}${suffix}`
+    }
+    const preferred32 = /([a-f0-9]{32})(?![a-f0-9])/i.exec(text)
+    if (preferred32?.[1]) return preferred32[1].toLowerCase()
+    const fallback = /([a-f0-9]{16,64})(?![a-f0-9])/i.exec(text)
+    return fallback?.[1]?.toLowerCase()
+  }
+
+  private extractVideoFileNameFromPackedRaw(raw: unknown): string | undefined {
+    const buffer = this.decodePackedInfoBuffer(raw)
+    if (!buffer || buffer.length === 0) return undefined
+    const candidates: string[] = []
+    let current = ''
+    for (const byte of buffer) {
+      const isHex =
+        (byte >= 0x30 && byte <= 0x39) ||
+        (byte >= 0x41 && byte <= 0x46) ||
+        (byte >= 0x61 && byte <= 0x66)
+      if (isHex) {
+        current += String.fromCharCode(byte)
+        continue
+      }
+      if (current.length >= 16) candidates.push(current)
+      current = ''
+    }
+    if (current.length >= 16) candidates.push(current)
+    if (candidates.length === 0) return undefined
+
+    const exact32 = candidates.find((item) => item.length === 32)
+    if (exact32) return exact32.toLowerCase()
+    const fallback = candidates.find((item) => item.length >= 16 && item.length <= 64)
+    return fallback?.toLowerCase()
+  }
+
+  private extractVideoFileNameFromRow(row: Record<string, any>, content?: string): string | undefined {
+    const packedRaw = this.getRowField(row, [
+      'packed_info_data', 'packedInfoData',
+      'packed_info_blob', 'packedInfoBlob',
+      'packed_info', 'packedInfo',
+      'BytesExtra', 'bytes_extra',
+      'WCDB_CT_packed_info',
+      'reserved0', 'Reserved0', 'WCDB_CT_Reserved0'
+    ])
+    const byPacked = this.extractVideoFileNameFromPackedRaw(packedRaw)
+    if (byPacked) return byPacked
+
+    const byColumn = this.normalizeVideoFileToken(this.getRowField(row, [
+      'video_md5', 'videoMd5', 'raw_md5', 'rawMd5', 'video_file_name', 'videoFileName'
+    ]))
+    if (byColumn) return byColumn
+
+    return this.normalizeVideoFileToken(this.extractVideoMd5(content || ''))
   }
 
   private resolveFileAttachmentRoots(): string[] {
@@ -4567,7 +4648,7 @@ class ExportService {
             // 优先复用游标返回的字段，缺失时再回退到 XML 解析。
             imageMd5 = String(row.image_md5 || row.imageMd5 || '').trim() || undefined
             imageDatName = String(row.image_dat_name || row.imageDatName || '').trim() || undefined
-            videoMd5 = String(row.video_md5 || row.videoMd5 || '').trim() || undefined
+            videoMd5 = this.extractVideoFileNameFromRow(row, content)
 
             if (localType === 3 && content) {
               // 图片消息
@@ -4575,7 +4656,7 @@ class ExportService {
               imageDatName = imageDatName || this.extractImageDatName(content)
             } else if (localType === 43 && content) {
               // 视频消息
-              videoMd5 = videoMd5 || this.extractVideoMd5(content)
+              videoMd5 = videoMd5 || this.extractVideoFileNameFromRow(row, content)
             } else if (collectMode === 'full' && content && (localType === 49 || content.includes('<appmsg') || content.includes('&lt;appmsg'))) {
               // 检查是否是聊天记录消息（type=19），兼容大 localType 的 appmsg
               const normalizedContent = this.normalizeAppMessageContent(content)
@@ -4720,7 +4801,7 @@ class ExportService {
         }
 
         if (msg.localType === 43) {
-          const videoMd5 = String(row.video_md5 || row.videoMd5 || '').trim() || this.extractVideoMd5(content)
+          const videoMd5 = this.extractVideoFileNameFromRow(row, content)
           if (videoMd5) msg.videoMd5 = videoMd5
         }
       } catch (error) {
@@ -8941,12 +9022,14 @@ class ExportService {
     pendingSessionIds?: string[]
     successSessionIds?: string[]
     failedSessionIds?: string[]
+    sessionOutputPaths?: Record<string, string>
     error?: string
   }> {
     let successCount = 0
     let failCount = 0
     const successSessionIds: string[] = []
     const failedSessionIds: string[] = []
+    const sessionOutputPaths: Record<string, string> = {}
     const progressEmitter = this.createProgressEmitter(onProgress)
     let attachMediaTelemetry = false
     const emitProgress = (progress: ExportProgress, options?: { force?: boolean }) => {
@@ -9144,7 +9227,8 @@ class ExportService {
           stopped: true,
           pendingSessionIds: [...queue],
           successSessionIds,
-          failedSessionIds
+          failedSessionIds,
+          sessionOutputPaths
         }
       }
       if (pauseRequested) {
@@ -9155,7 +9239,8 @@ class ExportService {
           paused: true,
           pendingSessionIds: [...queue],
           successSessionIds,
-          failedSessionIds
+          failedSessionIds,
+          sessionOutputPaths
         }
       }
 
@@ -9266,6 +9351,7 @@ class ExportService {
             if (hasNoDataChange) {
               successCount++
               successSessionIds.push(sessionId)
+              sessionOutputPaths[sessionId] = preferredOutputPath
               activeSessionRatios.delete(sessionId)
               completedCount++
               emitProgress({
@@ -9311,6 +9397,7 @@ class ExportService {
           if (result.success) {
             successCount++
             successSessionIds.push(sessionId)
+            sessionOutputPaths[sessionId] = outputPath
             if (typeof messageCountHint === 'number' && messageCountHint >= 0) {
               exportRecordService.saveRecord(sessionId, effectiveOptions.format, messageCountHint, {
                 sourceLatestMessageTimestamp: typeof latestTimestampHint === 'number' && latestTimestampHint > 0
@@ -9401,7 +9488,8 @@ class ExportService {
           stopped: true,
           pendingSessionIds,
           successSessionIds,
-          failedSessionIds
+          failedSessionIds,
+          sessionOutputPaths
         }
       }
       if (pauseRequested && pendingSessionIds.length > 0) {
@@ -9412,7 +9500,8 @@ class ExportService {
           paused: true,
           pendingSessionIds,
           successSessionIds,
-          failedSessionIds
+          failedSessionIds,
+          sessionOutputPaths
         }
       }
 
@@ -9425,7 +9514,7 @@ class ExportService {
       }, { force: true })
       progressEmitter.flush()
 
-      return { success: true, successCount, failCount, successSessionIds, failedSessionIds }
+      return { success: true, successCount, failCount, successSessionIds, failedSessionIds, sessionOutputPaths }
     } catch (e) {
       progressEmitter.flush()
       return { success: false, successCount, failCount, error: String(e) }

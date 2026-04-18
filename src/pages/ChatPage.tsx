@@ -7424,14 +7424,29 @@ function ChatPage(props: ChatPageProps) {
                           <span>数据库分布</span>
                         </div>
                         {Array.isArray(sessionDetail.messageTables) && sessionDetail.messageTables.length > 0 ? (
-                          <div className="table-list">
-                            {sessionDetail.messageTables.map((t, i) => (
-                              <div key={i} className="table-item">
-                                <span className="db-name">{t.dbName}</span>
-                                <span className="table-count">{t.count.toLocaleString()} 条</span>
-                              </div>
-                            ))}
-                          </div>
+                          <>
+                            <div className="table-name-summary">
+                              <span className="table-name-label">表名</span>
+                              <span className="table-name-value">
+                                {(() => {
+                                  const tableNames = Array.from(new Set(
+                                    sessionDetail.messageTables
+                                      .map(item => String(item.tableName || '').trim())
+                                      .filter(Boolean)
+                                  ))
+                                  return tableNames[0] || '—'
+                                })()}
+                              </span>
+                            </div>
+                            <div className="table-list">
+                              {sessionDetail.messageTables.map((t, i) => (
+                                <div key={`${t.dbName}-${t.tableName}-${i}`} className="table-item">
+                                  <span className="db-name">{t.dbName || '—'}</span>
+                                  <span className="table-count">{t.count.toLocaleString()} 条</span>
+                                </div>
+                              ))}
+                            </div>
+                          </>
                         ) : (
                           <div className="detail-table-placeholder">
                             {isLoadingDetailExtra ? '统计中...' : '暂无统计数据'}

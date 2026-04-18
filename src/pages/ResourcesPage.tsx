@@ -1,5 +1,5 @@
 import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, type HTMLAttributes } from 'react'
-import { Calendar, Image as ImageIcon, Loader2, PlayCircle, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { Calendar, Image as ImageIcon, Info, Loader2, PlayCircle, RefreshCw, Trash2, UserRound } from 'lucide-react'
 import { VirtuosoGrid } from 'react-virtuoso'
 import { finishBackgroundTask, registerBackgroundTask, updateBackgroundTask } from '../services/backgroundTaskMonitor'
 import './ResourcesPage.scss'
@@ -28,9 +28,10 @@ interface ContactOption {
 }
 
 type DialogState = {
-  mode: 'alert' | 'confirm'
+  mode: 'alert' | 'confirm' | 'info'
   title: string
-  message: string
+  message?: string
+  infoRows?: Array<{ label: string; value: string }>
   confirmText?: string
   cancelText?: string
   onConfirm?: (() => void) | null
@@ -115,6 +116,12 @@ function formatTimeLabel(timestampSec: number): string {
   })
 }
 
+function formatInfoValue(value: unknown): string {
+  if (value === null || value === undefined) return '-'
+  const text = String(value).trim()
+  return text || '-'
+}
+
 function extractVideoTitle(content?: string): string {
   const xml = String(content || '')
   if (!xml) return '视频'
@@ -152,6 +159,7 @@ const MediaCard = memo(function MediaCard({
   decrypting,
   onToggleSelect,
   onDelete,
+  onShowInfo,
   onImagePreviewAction,
   onUpdateImageQuality,
   onOpenVideo,
@@ -167,6 +175,7 @@ const MediaCard = memo(function MediaCard({
   decrypting: boolean
   onToggleSelect: (item: MediaStreamItem) => void
   onDelete: (item: MediaStreamItem) => void
+  onShowInfo: (item: MediaStreamItem) => void
   onImagePreviewAction: (item: MediaStreamItem) => void
   onUpdateImageQuality: (item: MediaStreamItem) => void
   onOpenVideo: (item: MediaStreamItem) => void
@@ -178,6 +187,9 @@ const MediaCard = memo(function MediaCard({
 
   return (
     <article className={`media-card ${selected ? 'selected' : ''} ${isDecryptingVisual ? 'decrypting' : ''}`}>
+      <button type="button" className="floating-info" onClick={() => onShowInfo(item)} aria-label="查看资源信息">
+        <Info size={14} />
+      </button>
       <button type="button" className="floating-delete" onClick={() => onDelete(item)} aria-label="删除资源">
         <Trash2 size={14} />
       </button>
@@ -796,6 +808,93 @@ function ResourcesPage() {
     return md5
   }, [])
 
+  const showMediaInfo = useCallback(async (item: MediaStreamItem) => {
+    const itemKey = getItemKey(item)
+    const mediaLabel = item.mediaType === 'image' ? '图片' : '视频'
+    const baseRows: Array<{ label: string; value: string }> = [
+      { label: '资源类型', value: mediaLabel },
+      { label: '会话 ID', value: formatInfoValue(item.sessionId) },
+      { label: '消息 LocalId', value: formatInfoValue(item.localId) },
+      { label: '消息时间', value: formatTimeLabel(item.createTime) },
+      { label: '发送方', value: formatInfoValue(item.senderUsername) },
+      { label: '是否我发送', value: item.isSend === 1 ? '是' : (item.isSend === 0 ? '否' : '-') }
+    ]
+
+    setDialog({
+      mode: 'info',
+      title: `${mediaLabel}信息`,
+      infoRows: [...baseRows, { label: '状态', value: '正在读取缓存信息...' }],
+      confirmText: '关闭',
+      onConfirm: null
+    })
+
+    try {
+      if (item.mediaType === 'image') {
+        const resolved = await window.electronAPI.image.resolveCache({
+          sessionId: item.sessionId,
+          imageMd5: normalizeMediaToken(item.imageMd5) || undefined,
+          imageDatName: getSafeImageDatName(item) || undefined,
+          createTime: Number(item.createTime || 0) || undefined,
+          preferFilePath: true,
+          hardlinkOnly: true,
+          allowCacheIndex: true,
+          suppressEvents: true
+        })
+        const previewPath = previewPathMapRef.current[itemKey] || previewPatchRef.current[itemKey] || ''
+        const cachePath = String(resolved?.localPath || previewPath || '').trim()
+        const rows: Array<{ label: string; value: string }> = [
+          ...baseRows,
+          { label: 'imageMd5', value: formatInfoValue(normalizeMediaToken(item.imageMd5)) },
+          { label: 'imageDatName', value: formatInfoValue(getSafeImageDatName(item)) },
+          { label: '列表预览路径', value: formatInfoValue(previewPath) },
+          { label: '缓存命中', value: resolved?.success && cachePath ? '是' : '否' },
+          { label: '缓存路径', value: formatInfoValue(cachePath) },
+          { label: '缓存可更新', value: resolved?.hasUpdate ? '是' : '否' },
+          { label: '缓存状态', value: resolved?.success ? '可用' : formatInfoValue(resolved?.error || resolved?.failureKind || '未命中') }
+        ]
+        setDialog({
+          mode: 'info',
+          title: '图片信息',
+          infoRows: rows,
+          confirmText: '关闭',
+          onConfirm: null
+        })
+        return
+      }
+
+      const resolvedMd5 = await resolveItemVideoMd5(item)
+      const videoInfo = resolvedMd5
+        ? await window.electronAPI.video.getVideoInfo(resolvedMd5, { includePoster: true, posterFormat: 'fileUrl' })
+        : null
+      const posterPath = videoPosterMapRef.current[itemKey] || posterPatchRef.current[itemKey] || ''
+      const rows: Array<{ label: string; value: string }> = [
+        ...baseRows,
+        { label: 'videoMd5(消息)', value: formatInfoValue(normalizeMediaToken(item.videoMd5)) },
+        { label: 'videoMd5(解析)', value: formatInfoValue(resolvedMd5) },
+        { label: '视频文件存在', value: videoInfo?.success && videoInfo.exists ? '是' : '否' },
+        { label: '视频路径', value: formatInfoValue(videoInfo?.videoUrl) },
+        { label: '同名封面路径', value: formatInfoValue(videoInfo?.coverUrl) },
+        { label: '列表封面路径', value: formatInfoValue(posterPath) },
+        { label: '视频状态', value: videoInfo?.success ? '可用' : formatInfoValue(videoInfo?.error || '未找到') }
+      ]
+      setDialog({
+        mode: 'info',
+        title: '视频信息',
+        infoRows: rows,
+        confirmText: '关闭',
+        onConfirm: null
+      })
+    } catch (e) {
+      setDialog({
+        mode: 'info',
+        title: `${mediaLabel}信息`,
+        infoRows: [...baseRows, { label: '读取失败', value: formatInfoValue(String(e)) }],
+        confirmText: '关闭',
+        onConfirm: null
+      })
+    }
+  }, [resolveItemVideoMd5])
+
   const resolveVideoPoster = useCallback(async (item: MediaStreamItem) => {
     if (item.mediaType !== 'video') return
     const itemKey = getItemKey(item)
@@ -815,7 +914,7 @@ function ResourcesPage() {
         attemptedVideoPosterKeysRef.current.add(itemKey)
         return
       }
-      const poster = String(info.coverUrl || info.thumbUrl || '')
+      const poster = String(info.coverUrl || '')
       if (!poster) {
         attemptedVideoPosterKeysRef.current.add(itemKey)
         return
@@ -1371,6 +1470,7 @@ function ResourcesPage() {
                   decrypting={decryptingKeys.has(itemKey)}
                   onToggleSelect={toggleSelect}
                   onDelete={deleteOne}
+                  onShowInfo={showMediaInfo}
                   onImagePreviewAction={onImagePreviewAction}
                   onUpdateImageQuality={updateImageQuality}
                   onOpenVideo={openVideo}
@@ -1388,7 +1488,20 @@ function ResourcesPage() {
         <div className="resource-dialog-mask">
           <div className="resource-dialog" role="dialog" aria-modal="true" aria-label={dialog.title}>
             <header className="dialog-header">{dialog.title}</header>
-            <div className="dialog-body">{dialog.message}</div>
+            <div className="dialog-body">
+              {dialog.mode === 'info' ? (
+                <div className="dialog-info-list">
+                  {(dialog.infoRows || []).map((row, idx) => (
+                    <div className="dialog-info-row" key={`${row.label}-${idx}`}>
+                      <span className="info-label">{row.label}</span>
+                      <span className="info-value" title={row.value}>{row.value}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                dialog.message
+              )}
+            </div>
             <footer className="dialog-actions">
               {dialog.mode === 'confirm' && (
                 <button type="button" className="dialog-btn ghost" onClick={closeDialog}>

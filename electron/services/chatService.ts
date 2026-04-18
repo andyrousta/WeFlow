@@ -4336,9 +4336,9 @@ class ChatService {
         encrypVer = imageInfo.encrypVer
         cdnThumbUrl = imageInfo.cdnThumbUrl
         imageDatName = this.parseImageDatNameFromRow(row)
-      } else if (localType === 43 && content) {
-        // 视频消息
-        videoMd5 = this.parseVideoMd5(content)
+      } else if (localType === 43) {
+        // 视频消息：优先从 packed_info_data 提取真实文件名（32位十六进制），再回退 XML
+        videoMd5 = this.parseVideoFileNameFromRow(row, content)
       } else if (localType === 34 && content) {
         voiceDurationSeconds = this.parseVoiceDurationSeconds(content)
       } else if (localType === 42 && content) {
@@ -4876,7 +4876,20 @@ class ChatService {
   }
 
   private parseImageDatNameFromRow(row: Record<string, any>): string | undefined {
-    const packed = row.packed_info_data
+    const packed = this.getRowField(row, [
+      'packed_info_data',
+      'packedInfoData',
+      'packed_info_blob',
+      'packedInfoBlob',
+      'packed_info',
+      'packedInfo',
+      'BytesExtra',
+      'bytes_extra',
+      'WCDB_CT_packed_info',
+      'reserved0',
+      'Reserved0',
+      'WCDB_CT_Reserved0'
+    ])
     const buffer = this.decodePackedInfo(packed)
     if (!buffer || buffer.length === 0) return undefined
     const printable: number[] = []
@@ -4894,6 +4907,81 @@ class ChatService {
     return hexMatch?.[1]?.toLowerCase()
   }
 
+  private parseVideoFileNameFromRow(row: Record<string, any>, content?: string): string | undefined {
+    const packed = this.getRowField(row, [
+      'packed_info_data',
+      'packedInfoData',
+      'packed_info_blob',
+      'packedInfoBlob',
+      'packed_info',
+      'packedInfo',
+      'BytesExtra',
+      'bytes_extra',
+      'WCDB_CT_packed_info',
+      'reserved0',
+      'Reserved0',
+      'WCDB_CT_Reserved0'
+    ])
+    const packedToken = this.extractVideoTokenFromPackedRaw(packed)
+    if (packedToken) return packedToken
+
+    const byColumn = this.normalizeVideoFileToken(this.getRowField(row, [
+      'video_md5',
+      'videoMd5',
+      'raw_md5',
+      'rawMd5',
+      'video_file_name',
+      'videoFileName'
+    ]))
+    if (byColumn) return byColumn
+
+    return this.normalizeVideoFileToken(this.parseVideoMd5(content || ''))
+  }
+
+  private normalizeVideoFileToken(value: unknown): string | undefined {
+    let text = String(value || '').trim().toLowerCase()
+    if (!text) return undefined
+    text = text.replace(/^.*[\\/]/, '')
+    text = text.replace(/\.(?:mp4|mov|m4v|avi|mkv|flv|jpg|jpeg|png|gif|dat)$/i, '')
+    text = text.replace(/_thumb$/, '')
+    const directMatch = /^([a-f0-9]{16,64})(?:_raw)?$/i.exec(text)
+    if (directMatch) {
+      const suffix = /_raw$/i.test(text) ? '_raw' : ''
+      return `${directMatch[1].toLowerCase()}${suffix}`
+    }
+    const preferred32 = /([a-f0-9]{32})(?![a-f0-9])/i.exec(text)
+    if (preferred32?.[1]) return preferred32[1].toLowerCase()
+    const generic = /([a-f0-9]{16,64})(?![a-f0-9])/i.exec(text)
+    return generic?.[1]?.toLowerCase()
+  }
+
+  private extractVideoTokenFromPackedRaw(raw: unknown): string | undefined {
+    const buffer = this.decodePackedInfo(raw)
+    if (!buffer || buffer.length === 0) return undefined
+    const candidates: string[] = []
+    let current = ''
+    for (const byte of buffer) {
+      const isHex =
+        (byte >= 0x30 && byte <= 0x39) ||
+        (byte >= 0x41 && byte <= 0x46) ||
+        (byte >= 0x61 && byte <= 0x66)
+      if (isHex) {
+        current += String.fromCharCode(byte)
+        continue
+      }
+      if (current.length >= 16) candidates.push(current)
+      current = ''
+    }
+    if (current.length >= 16) candidates.push(current)
+    if (candidates.length === 0) return undefined
+
+    const exact32 = candidates.find((item) => item.length === 32)
+    if (exact32) return exact32.toLowerCase()
+
+    const fallback = candidates.find((item) => item.length >= 16 && item.length <= 64)
+    return fallback?.toLowerCase()
+  }
+
   private decodePackedInfo(raw: any): Buffer | null {
     if (!raw) return null
     if (Buffer.isBuffer(raw)) return raw
@@ -4901,9 +4989,10 @@ class ChatService {
     if (Array.isArray(raw)) return Buffer.from(raw)
     if (typeof raw === 'string') {
       const trimmed = raw.trim()
-      if (/^[a-fA-F0-9]+$/.test(trimmed) && trimmed.length % 2 === 0) {
+      const compactHex = trimmed.replace(/\s+/g, '')
+      if (/^[a-fA-F0-9]+$/.test(compactHex) && compactHex.length % 2 === 0) {
         try {
-          return Buffer.from(trimmed, 'hex')
+          return Buffer.from(compactHex, 'hex')
         } catch { }
       }
       try {
@@ -10490,6 +10579,8 @@ class ChatService {
       const imgInfo = this.parseImageInfo(rawContent)
       Object.assign(msg, imgInfo)
       msg.imageDatName = this.parseImageDatNameFromRow(row)
+    } else if (msg.localType === 43) { // Video
+      msg.videoMd5 = this.parseVideoFileNameFromRow(row, rawContent)
     } else if (msg.localType === 47) { // Emoji
       const emojiInfo = this.parseEmojiInfo(rawContent)
       msg.emojiCdnUrl = emojiInfo.cdnUrl
