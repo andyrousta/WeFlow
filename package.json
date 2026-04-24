@@ -29,12 +29,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/weflow/weflow.git"
+    "url": "https://github.com/hicccc77/WeFlow.git"
   },
   "bugs": {
-    "url": "https://github.com/weflow/weflow/issues"
+    "url": "https://github.com/hicccc77/WeFlow/issues"
   },
-  "homepage": "https://github.com/weflow/weflow#readme",
+  "homepage": "https://github.com/hicccc77/WeFlow#readme",
   "engines": {
     "node": ">=18.0.0"
   },
