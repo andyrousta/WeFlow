@@ -41,6 +41,8 @@
     "noUncheckedIndexedAccess": false,
     /* enabling this to catch missing return types while learning the codebase */
     "noImplicitAny": true,
+    /* personal: catch accidental use of deprecated APIs while exploring */
+    "noImplicitOverride": true,
 
     /* Completeness */
     "skipLibCheck": true
