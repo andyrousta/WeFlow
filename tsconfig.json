@@ -44,7 +44,7 @@
     /* personal: catch accidental use of deprecated APIs while exploring */
     "noImplicitOverride": true,
     /* personal: helps me spot unread promise results while learning async patterns */
-    "noFloatingPromises": false,
+    /* noFloatingPromises is a tsc-eslint rule, not a valid tsconfig option - removed */
 
     /* Completeness */
     "skipLibCheck": true
