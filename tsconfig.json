@@ -39,6 +39,8 @@
     "noFallthroughCasesInSwitch": true,
     /* disabled noUncheckedIndexedAccess locally - too noisy during exploration */
     "noUncheckedIndexedAccess": false,
+    /* enabling this to catch missing return types while learning the codebase */
+    "noImplicitAny": true,
 
     /* Completeness */
     "skipLibCheck": true
