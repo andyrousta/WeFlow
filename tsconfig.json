@@ -50,6 +50,8 @@
     "exactOptionalPropertyTypes": true,
     /* personal: enabled to ensure consistent property initialization order - useful while reading class-heavy code */
     "useDefineForClassFields": true,
+    /* personal: stricter null checks help me understand the data flow better while reading unfamiliar code */
+    "strictNullChecks": true,
 
     /* Completeness */
     "skipLibCheck": true
