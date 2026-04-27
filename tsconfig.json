@@ -45,6 +45,8 @@
     "noImplicitOverride": true,
     /* personal: helps me spot unread promise results while learning async patterns */
     /* noFloatingPromises is a tsc-eslint rule, not a valid tsconfig option - removed */
+    /* personal: surface exact optional property types rather than allowing undefined assignment */
+    "exactOptionalPropertyTypes": true,
 
     /* Completeness */
     "skipLibCheck": true
